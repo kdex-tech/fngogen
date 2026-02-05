@@ -1,6 +1,6 @@
 # Image URL to use all building/pushing image targets
-IMG ?= kdex-tech/kdex-fngogen:latest
-BINARY ?= kdex-fngogen
+IMG ?= kdex-tech/fngogen:latest
+BINARY ?= fngogen
 
 REPOSITORY ?= 
 # if REPOSITORY is set make sure it ends with a /
