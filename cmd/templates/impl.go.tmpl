@@ -1,0 +1,89 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"function/api"
+
+	{{if .Security}}
+	"log"
+	"os"
+	"time"
+	"github.com/MicahParks/keyfunc/v2"
+	"github.com/golang-jwt/jwt/v5"
+	{{end}}
+)
+
+type service struct {
+	// TODO: Add fields like storage clients, cache clients, etc.
+}
+
+func NewService() *service {
+	// TODO: Initialize fields like storage clients, cache clients, etc.
+	return &service{}
+}
+
+{{range .Methods}}
+func (s *service) {{.Name}}({{.FullParams}}) {{.Returns}} {
+	// TODO: Implement logic
+	return nil, fmt.Errorf("not implemented")
+}
+{{end}}
+
+{{if .Security}}
+type security struct {
+	jwks *keyfunc.JWKS
+}
+
+func NewSecurity() *security {
+	jwksURL := os.Getenv("JWKS_URL")
+	if jwksURL == "" {
+		log.Fatal("JWKS_URL environment variable is required for security")
+	}
+	jwks, err := keyfunc.Get(jwksURL, keyfunc.Options{
+		RefreshInterval: time.Hour,
+	})
+	if err != nil {
+		log.Fatalf("failed to fetch JWKS from %s: %v", jwksURL, err)
+	}
+	return &security{jwks: jwks}
+}
+
+// ContextKey is a custom type for context keys to avoid collisions.
+type ContextKey string
+
+const (
+	// UserContextKey is the key used to store the user claims in the context.
+	UserContextKey ContextKey = "user"
+)
+
+func (s *security) HandleBearer(ctx context.Context, operationName api.OperationName, t api.Bearer) (context.Context, error) {
+	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc)
+	if err != nil || !token.Valid {
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	userEntitlements, ok := claims["entitlements"].([]any)
+
+	if !ok {
+		return nil, fmt.Errorf("missing required entitlements claim")
+	}
+
+	for _, requiredRole := range t.Roles {
+		if !hasScope(userEntitlements, requiredRole) {
+			return nil, fmt.Errorf("missing required entitlement: %s", requiredRole)
+		}
+	}
+	return context.WithValue(ctx, UserContextKey, claims), nil
+}
+
+func hasScope(userScopes []any, requiredRole string) bool {
+	for _, userScope := range userScopes {
+		if requiredRole == userScope.(string) {
+			return true
+		}
+	}
+	return false
+}
+{{end}}
