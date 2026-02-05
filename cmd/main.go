@@ -213,27 +213,35 @@ func run(args []string) error {
 	}
 
 	if _, err := os.Stat(*targetPtr); err != nil {
-		os.MkdirAll(*targetPtr, 0755)
+		if err := os.MkdirAll(*targetPtr, 0755); err != nil {
+			return err
+		}
 	}
 
-	generateSourceFile(mainTemplate, templateData, *targetPtr, "main.go")
-	generateSourceFile(implTemplate, templateData, *targetPtr, "impl.go")
+	if err := generateSourceFile(mainTemplate, templateData, *targetPtr, "main.go"); err != nil {
+		return err
+	}
+	if err := generateSourceFile(implTemplate, templateData, *targetPtr, "impl.go"); err != nil {
+		return err
+	}
 
 	return nil
 }
 
-func generateSourceFile(templateString string, templateData TemplateData, outputDir string, outputFileName string) {
+func generateSourceFile(templateString string, templateData TemplateData, outputDir string, outputFileName string) error {
 	tmpl := template.Must(template.New("impl").Funcs(sprig.TxtFuncMap()).Parse(templateString))
 	var implBuf bytes.Buffer
-	tmpl.Execute(&implBuf, templateData)
+	if err := tmpl.Execute(&implBuf, templateData); err != nil {
+		return err
+	}
 
 	formattedOut, err := format.Source(implBuf.Bytes())
 	if err != nil {
-		os.WriteFile(outputDir+"/debug-"+outputFileName, implBuf.Bytes(), 0644)
-		panic(err)
+		_ = os.WriteFile(outputDir+"/debug-"+outputFileName, implBuf.Bytes(), 0644)
+		return err
 	}
 
-	os.WriteFile(outputDir+"/"+outputFileName, formattedOut, 0644)
+	return os.WriteFile(outputDir+"/"+outputFileName, formattedOut, 0644)
 }
 
 func prefixType(expr ast.Expr, prefix string) ast.Expr {
@@ -277,7 +285,7 @@ func parseParams(fset *token.FileSet, list *ast.FieldList) (string, []string) {
 		prefixedType := prefixType(field.Type, targetPkg)
 
 		var typeBuf bytes.Buffer
-		printer.Fprint(&typeBuf, fset, prefixedType)
+		_ = printer.Fprint(&typeBuf, fset, prefixedType)
 		typeStr := strings.ReplaceAll(strings.ReplaceAll(typeBuf.String(), "\n", ""), "\t", "")
 
 		if len(field.Names) > 0 {
@@ -303,7 +311,7 @@ func stringifyFields(fset *token.FileSet, list *ast.FieldList) string {
 		prefixedType := prefixType(f.Type, targetPkg)
 
 		var b bytes.Buffer
-		printer.Fprint(&b, fset, prefixedType)
+		_ = printer.Fprint(&b, fset, prefixedType)
 		bString := strings.ReplaceAll(strings.ReplaceAll(b.String(), "\n", ""), "\t", "")
 		parts = append(parts, bString)
 	}

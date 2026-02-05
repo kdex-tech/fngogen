@@ -11,7 +11,9 @@ import (
 
 func Test_run(t *testing.T) {
 	if _, err := os.Stat("../tmp"); err != nil {
-		os.MkdirAll("../tmp", 0755)
+		if err := os.MkdirAll("../tmp", 0755); err != nil {
+			t.Fatalf("failed to create tmp dir: %v", err)
+		}
 	}
 
 	// get the current directory
@@ -52,16 +54,22 @@ func Test_run(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := os.Stat("../tmp/" + tt.workDir); err == nil {
-				os.RemoveAll("../tmp/" + tt.workDir)
+				if err := os.RemoveAll("../tmp/" + tt.workDir); err != nil {
+					t.Fatalf("failed to remove work dir: %v", err)
+				}
 			}
-			os.MkdirAll("../tmp/"+tt.workDir, 0755)
+			if err := os.MkdirAll("../tmp/"+tt.workDir, 0755); err != nil {
+				t.Fatalf("failed to create work dir: %v", err)
+			}
 			//defer os.RemoveAll("../tmp/" + tt.workDir)
 			err := os.Chdir("../tmp/" + tt.workDir)
 			if err != nil {
 				fmt.Printf("Could not change directory: %v\n", err)
 				return
 			}
-			defer os.Chdir(currentDir)
+			defer func() {
+				_ = os.Chdir(currentDir)
+			}()
 
 			goModInit := exec.Command("go", "mod", "init", "function")
 			_, err = goModInit.Output()
@@ -73,7 +81,9 @@ func Test_run(t *testing.T) {
 
 //go:generate go run github.com/ogen-go/ogen/cmd/ogen@latest --target api --clean %s
 `, tt.openapi)
-			os.WriteFile("generate.go", []byte(generateFile), 0644)
+			if err := os.WriteFile("generate.go", []byte(generateFile), 0644); err != nil {
+				t.Fatalf("failed to write generate.go: %v", err)
+			}
 
 			goGenerate := exec.Command("go", "generate", "./...")
 			_, err = goGenerate.Output()
