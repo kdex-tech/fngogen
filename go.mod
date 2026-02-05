@@ -1,4 +1,4 @@
-module kdex.dev/fngogen
+module github.com/kdex-tech/fngogen
 
 go 1.25.6
 
