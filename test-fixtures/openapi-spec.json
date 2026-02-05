@@ -1,0 +1,103 @@
+{
+  "components": {
+    "responses": {
+      "BadRequest": {
+        "description": "Bad Request"
+      },
+      "Found": {
+        "description": "Found"
+      },
+      "InternalServerError": {
+        "description": "Internal Server Error"
+      },
+      "NotFound": {
+        "description": "Not Found"
+      },
+      "SeeOther": {
+        "description": "See Other"
+      }
+    },
+    "schemas": {
+      "User": {
+        "description": "Inferred from request body",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "id": {
+            "type": "number"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Auto-generated OpenAPI specification for KDex Host",
+    "title": "KDex Host: gen-v1-users",
+    "version": "1.0.0"
+  },
+  "openapi": "3.0.0",
+  "paths": {
+    "/v1/users/{id}": {
+      "put": {
+        "description": "PUT /v1/users/{id}",
+        "operationId": "gen-v1-users-id-put",
+        "parameters": [
+          {
+            "description": "Path parameter: id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/User"
+              }
+            }
+          },
+          "description": "The request body schema"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "summary": "gen-v1-users-id-put",
+        "tags": [
+          "gen-v1-users"
+        ]
+      },
+      "x-kdex-metadata": {
+        "contact": {}
+      },
+      "x-kdex-type": "FUNCTION"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://sim.docker.localhost"
+    }
+  ],
+  "tags": [
+    {
+      "name": "gen-v1-users"
+    }
+  ]
+}
