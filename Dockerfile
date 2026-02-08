@@ -3,6 +3,8 @@ FROM golang:1.25-alpine
 ARG TARGETOS
 ARG TARGETARCH
 
+RUN apk add --no-cache tree
+
 WORKDIR /
 # Copy the Go Modules manifests
 COPY go.mod go.mod
@@ -22,4 +24,7 @@ COPY cmd/ cmd/
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o fngogen cmd/main.go
 
-USER 65532:65532
+COPY entry-point.sh /entry-point.sh
+RUN chmod +x /entry-point.sh
+
+ENTRYPOINT ["/entry-point.sh"]
