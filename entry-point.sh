@@ -2,10 +2,10 @@
 
 set -e
 
-cd ${WORKING_DIRECTORY}
+cd "${WORKDIR}"
 source .env
 
-cd ${TARGET_DIR}
+cd "${TARGET_DIR}"
 
 [ ! -f "go.mod" ] && go mod init function
 
@@ -19,7 +19,7 @@ EOF
 
 go generate ./...
 
-/fngogen
+fngogen
 
 go mod tidy
 go vet ./...

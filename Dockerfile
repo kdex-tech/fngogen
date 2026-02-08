@@ -22,9 +22,11 @@ COPY cmd/ cmd/
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o fngogen cmd/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags="-s -w" -a -o fngogen cmd/main.go; \
+    mv fngogen /usr/local/bin/fngogen; \
+    chmod 777 /usr/local/bin/fngogen
 
-COPY entry-point.sh /entry-point.sh
-RUN chmod +x /entry-point.sh
+COPY entry-point.sh /usr/local/bin/entry-point.sh
+RUN chmod 777 /usr/local/bin/entry-point.sh
 
-ENTRYPOINT ["/entry-point.sh"]
+ENTRYPOINT ["/usr/local/bin/entry-point.sh"]
