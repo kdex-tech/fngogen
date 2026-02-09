@@ -8,10 +8,23 @@ import (
 	"os"
 
 	"function/api"
+
+	{{if .Security}}
+	"context"
+	"slices"
+	{{if .APIKeySecurity}}
+	"strings"
+	{{end}}
+	"time"
+	"github.com/MicahParks/keyfunc/v2"
+	{{if or .APIKeySecurity .BearerSecurity .OAuth2Security}}
+	"github.com/golang-jwt/jwt/v5"
+	{{end}}
+	{{end}}
 )
 
 func main() {
-	srv, err := api.NewServer(NewService(){{if .Security}}, NewSecurity(){{end}})
+	srv, err := api.NewServer(NewHandler(){{if .Security}}, NewSecurity(){{end}})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -23,3 +36,149 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
+{{if .Security}}
+type security struct {
+	{{if .APIKeySecurity}}
+	apiKey            string
+	apiKeyEntitlments []string
+	{{end}}
+	jwks *keyfunc.JWKS
+}
+
+func NewSecurity() *security {
+	jwksURL := os.Getenv("JWKS_URL")
+	if jwksURL == "" {
+		log.Fatal("JWKS_URL environment variable is required for security")
+	}
+	jwks, err := keyfunc.Get(jwksURL, keyfunc.Options{
+		RefreshInterval: time.Hour,
+	})
+	if err != nil {
+		log.Fatalf("failed to fetch JWKS from %s: %v", jwksURL, err)
+	}
+	{{if .APIKeySecurity}}
+	apiKey := os.Getenv("API_KEY")
+	if apiKey == "" {
+		log.Fatal("API_KEY environment variable is required for security")
+	}
+	apiKeyEntitlments := strings.Split(os.Getenv("API_KEY_ENTITLEMENTS"), ",")
+	{{end}}
+
+	return &security{
+		jwks: jwks,
+		{{if .APIKeySecurity}}
+		apiKey:            apiKey,
+		apiKeyEntitlments: apiKeyEntitlments,
+		{{end}}
+	}
+}
+
+// ContextKey is a custom type for context keys to avoid collisions.
+type ContextKey string
+
+const (
+	// UserContextKey is the key used to store the user claims in the context.
+	UserContextKey ContextKey = "user"
+)
+
+{{if .APIKeySecurity}}
+func (s *security) HandleApikey(ctx context.Context, operationName api.OperationName, t api.Apikey) (context.Context, error) {
+	key := t.APIKey
+
+	if key != s.apiKey {
+		return nil, fmt.Errorf("invalid API key")
+	}
+
+	for _, requiredRole := range t.Roles {
+		if !slices.Contains(s.apiKeyEntitlments, requiredRole) {
+			return nil, fmt.Errorf("key does not have required role: %s", requiredRole)
+		}
+	}
+
+	claims := map[string]any{
+		"apikey": "valid",
+		"roles":  s.apiKeyEntitlments,
+	}
+
+	return s.mergeClaims(ctx, claims), nil
+}
+{{end}}
+
+{{if .BearerSecurity}}
+func (s *security) HandleBearer(ctx context.Context, operationName api.OperationName, t api.Bearer) (context.Context, error) {
+	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc)
+	if err != nil || !token.Valid {
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	userEntitlements, ok := claims["entitlements"].([]string)
+
+	if !ok {
+		return nil, fmt.Errorf("missing required entitlements claim")
+	}
+
+	for _, requiredRole := range t.Roles {
+		if !slices.Contains(userEntitlements, requiredRole) {
+			return nil, fmt.Errorf("missing required entitlement: %s", requiredRole)
+		}
+	}
+
+	return s.mergeClaims(ctx, claims), nil
+}
+{{end}}
+
+{{if .OAuth2Security}}	
+func (s *security) HandleOAuth2(ctx context.Context, operationName api.OperationName, t api.OAuth2) (context.Context, error) {
+	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc)
+	if err != nil || !token.Valid {
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	userScopes, ok := claims["scopes"].([]string)
+
+	if !ok {
+		return nil, fmt.Errorf("missing required scopes claim")
+	}
+
+	for _, requiredScope := range t.Scopes {
+		if !slices.Contains(userScopes, requiredScope) {
+			return nil, fmt.Errorf("missing required scope: %s", requiredScope)
+		}
+	}
+
+	return s.mergeClaims(ctx, claims), nil
+}
+{{end}}
+
+{{if .OpenIdConnectSecurity}}
+func (s *security) HandleOpenIdConnect(ctx context.Context, operationName api.OperationName, t api.OpenIdConnect) (context.Context, error) {
+	return ctx, nil
+}
+{{end}}
+
+func (s *security) mergeClaims(ctx context.Context, newClaims jwt.MapClaims) context.Context {
+	// 1. Get existing claims from context
+	claims, ok := ctx.Value(UserContextKey).(jwt.MapClaims)
+	if !ok {
+		claims = jwt.MapClaims{}
+	}
+	// 2. Merge new values into existing map
+	for k, v := range newClaims {
+		// Special handling for merging slices (like roles or scopes)
+		if existingSlice, isSlice := claims[k].([]string); isSlice {
+			if newSlice, ok := v.([]string); ok {
+				// Combine and deduplicate if necessary
+				claims[k] = append(existingSlice, newSlice...)
+				continue
+			}
+		}
+
+		// Default: Overwrite specific keys but keep other keys intact
+		claims[k] = v
+	}
+	return context.WithValue(ctx, UserContextKey, claims)
+}
+{{end}}

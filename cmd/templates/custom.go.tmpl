@@ -1,0 +1,29 @@
+package main
+
+import "function/api"
+
+/*
+IMPLEMENTATION INSTRUCTIONS:
+
+Make customHandler implement the api.Handler interface.
+If you want to iterate you can always temporarily call the methods of defaultHandler.
+
+HINT: To see how to extract security claims (like UserID) from the context, check
+the generated implementations in `default.go`.
+
+NOTE: This file will NOT be overwritten on regeneration.
+*/
+
+func NewHandler() api.Handler {
+	return &defaultHandler{}
+	// return &customHandler{}
+}
+
+// Uncommend the following to get you started
+/*
+type customHandler struct {}
+
+var _ api.Handler = (*customHandler)(nil)
+
+// implement handler methods
+*/

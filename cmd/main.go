@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	_ "embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -29,15 +30,22 @@ type MethodData struct {
 }
 
 type TemplateData struct {
-	Methods  []MethodData
-	Security bool
+	APIKeySecurity        bool
+	BearerSecurity        bool
+	Methods               []MethodData
+	OAuth2Security        bool
+	OpenIdConnectSecurity bool
+	Security              bool
 }
 
 //go:embed templates/main.go.tmpl
 var mainTemplate string
 
-//go:embed templates/impl.go.tmpl
-var implTemplate string
+//go:embed templates/default.go.tmpl
+var defaultTemplate string
+
+//go:embed templates/custom.go.tmpl
+var customTemplate string
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -50,6 +58,7 @@ func run(args []string) error {
 	flags := flag.NewFlagSet("app", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	targetPtr := flags.String("target", "cmd", "the target directory to generate the code")
+	specPtr := flags.String("spec", "api/openapi.json", "the path to the openapi spec")
 
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -90,14 +99,59 @@ func run(args []string) error {
 		return false
 	})
 
+	// read the openapi spec to check for all the security schemes implemented
+	if _, err := os.Stat(*specPtr); err != nil {
+		return err
+	}
+
+	content, err := os.ReadFile(*specPtr)
+	if err != nil {
+		return err
+	}
+
+	var spec map[string]interface{}
+	if err := json.Unmarshal(content, &spec); err != nil {
+		return err
+	}
+
 	security := false
-	if _, err := os.Stat("api/oas_security_gen.go"); err == nil {
-		security = true
+	apiKeySecurity := false
+	bearerSecurity := false
+	oauth2Security := false
+	openIdConnectSecurity := false
+	if spec["components"] != nil {
+		if components, ok := spec["components"].(map[string]interface{}); ok {
+			if securitySchemes, ok := components["securitySchemes"].(map[string]interface{}); ok {
+				if len(securitySchemes) > 0 {
+					security = true
+				}
+				for _, securityScheme := range securitySchemes {
+					if securityScheme.(map[string]interface{})["type"] == "apiKey" {
+						apiKeySecurity = true
+					}
+					if securityScheme.(map[string]interface{})["type"] == "http" {
+						if securityScheme.(map[string]interface{})["scheme"] == "bearer" {
+							bearerSecurity = true
+						}
+					}
+					if securityScheme.(map[string]interface{})["type"] == "oauth2" {
+						oauth2Security = true
+					}
+					if securityScheme.(map[string]interface{})["type"] == "openIdConnect" {
+						openIdConnectSecurity = true
+					}
+				}
+			}
+		}
 	}
 
 	templateData := TemplateData{
-		Methods:  methods,
-		Security: security,
+		APIKeySecurity:        apiKeySecurity,
+		BearerSecurity:        bearerSecurity,
+		Methods:               methods,
+		OAuth2Security:        oauth2Security,
+		OpenIdConnectSecurity: openIdConnectSecurity,
+		Security:              security,
 	}
 
 	if _, err := os.Stat(*targetPtr); err != nil {
@@ -106,17 +160,20 @@ func run(args []string) error {
 		}
 	}
 
-	if err := generateSourceFile(mainTemplate, templateData, *targetPtr, "main.go"); err != nil {
+	if err := generateSourceFile(mainTemplate, templateData, *targetPtr, "main.go", true); err != nil {
 		return err
 	}
-	if err := generateSourceFile(implTemplate, templateData, *targetPtr, "impl.go"); err != nil {
+	if err := generateSourceFile(defaultTemplate, templateData, *targetPtr, "default.go", true); err != nil {
+		return err
+	}
+	if err := generateSourceFile(customTemplate, templateData, *targetPtr, "custom.go", false); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func generateSourceFile(templateString string, templateData TemplateData, outputDir string, outputFileName string) error {
+func generateSourceFile(templateString string, templateData TemplateData, outputDir string, outputFileName string, overwrite bool) error {
 	tmpl := template.Must(template.New("impl").Funcs(sprig.TxtFuncMap()).Parse(templateString))
 	var implBuf bytes.Buffer
 	if err := tmpl.Execute(&implBuf, templateData); err != nil {
@@ -127,6 +184,12 @@ func generateSourceFile(templateString string, templateData TemplateData, output
 	if err != nil {
 		_ = os.WriteFile(outputDir+"/debug-"+outputFileName, implBuf.Bytes(), 0644)
 		return err
+	}
+
+	if !overwrite {
+		if _, err := os.Stat(outputDir + "/" + outputFileName); err == nil {
+			return nil
+		}
 	}
 
 	return os.WriteFile(outputDir+"/"+outputFileName, formattedOut, 0644)

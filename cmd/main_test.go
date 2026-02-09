@@ -41,15 +41,31 @@ func Test_run(t *testing.T) {
 			targetDir: "test",
 		},
 		{
-			name:    "with security",
-			openapi: `../../test-fixtures/openapi-spec-sec.json`,
+			name:    "with bearer security",
+			openapi: `../../test-fixtures/openapi-spec-bearer.json`,
 			workDir: "t3",
 		},
 		{
-			name:    "with security 2",
-			openapi: `../../test-fixtures/openapi-spec-2-sec.json`,
+			name:    "with bearer security 2",
+			openapi: `../../test-fixtures/openapi-spec-bearer-2.json`,
 			workDir: "t4",
 		},
+		{
+			name:    "with oauth2 security",
+			openapi: `../../test-fixtures/openapi-spec-oauth2.json`,
+			workDir: "t5",
+		},
+		{
+			name:    "with apiKey security",
+			openapi: `../../test-fixtures/openapi-spec-apikey.json`,
+			workDir: "t6",
+		},
+		// OpenID Connect security is not implemented yet in ogen
+		// {
+		// 	name:    "with openIdConnect security",
+		// 	openapi: `../../test-fixtures/openapi-spec-openIdConnect.json`,
+		// 	workDir: "t7",
+		// },
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -86,14 +102,17 @@ func Test_run(t *testing.T) {
 			}
 
 			goGenerate := exec.Command("go", "generate", "./...")
-			_, err = goGenerate.Output()
-			if !assert.NoError(t, err) {
+			out, err := goGenerate.CombinedOutput()
+			if !assert.NoError(t, err, string(out)) {
 				return
 			}
 
 			args := []string{}
 			if tt.targetDir != "" {
 				args = append(args, "--target", tt.targetDir)
+			}
+			if tt.openapi != "" {
+				args = append(args, "--spec", tt.openapi)
 			}
 
 			targetDir := tt.targetDir
@@ -107,13 +126,18 @@ func Test_run(t *testing.T) {
 			}
 
 			goModTidy := exec.Command("go", "mod", "tidy")
-			_, err = goModTidy.Output()
-			if !assert.NoError(t, err) {
+			out, err = goModTidy.CombinedOutput()
+			if !assert.NoError(t, err, string(out)) {
 				return
 			}
 
 			assert.FileExists(t, targetDir+"/main.go")
-			assert.FileExists(t, targetDir+"/impl.go")
+			assert.FileExists(t, targetDir+"/default.go")
+			assert.FileExists(t, targetDir+"/custom.go")
+
+			goBuild := exec.Command("go", "build", "./...")
+			out, err = goBuild.CombinedOutput()
+			assert.NoError(t, err, string(out))
 		})
 	}
 }
