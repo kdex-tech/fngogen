@@ -12,9 +12,7 @@ import (
 	{{if .Security}}
 	"context"
 	"slices"
-	{{if .APIKeySecurity}}
 	"strings"
-	{{end}}
 	"time"
 	"github.com/MicahParks/keyfunc/v2"
 	{{if or .APIKeySecurity .BearerSecurity .OAuth2Security}}
@@ -123,36 +121,7 @@ func (s *security) HandleBearer(ctx context.Context, operationName api.Operation
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
-	claims := token.Claims.(jwt.MapClaims)
-	if claims == nil {
-		return nil, fmt.Errorf("missing required claims")
-	}
-
-	if s.debug {
-		fmt.Println("claims", claims)
-	}
-
-	userEntitlementsRaw, ok := claims["entitlements"].([]any)
-
-	if !ok {
-		return nil, fmt.Errorf("missing required entitlements claim")
-	}
-
-	// Convert []any to []string
-	userEntitlements := make([]string, 0, len(userEntitlementsRaw))
-	for _, e := range userEntitlementsRaw {
-		if s, ok := e.(string); ok {
-			userEntitlements = append(userEntitlements, s)
-		}
-	}
-
-	for _, requiredRole := range t.Roles {
-		if !slices.Contains(userEntitlements, requiredRole) {
-			return nil, fmt.Errorf("missing required entitlement: %s", requiredRole)
-		}
-	}
-
-	return s.mergeClaims(ctx, claims), nil
+	return s.hasValidClaims(ctx, "entitlements", t.Roles, token.Claims.(jwt.MapClaims))
 }
 {{end}}
 
@@ -163,36 +132,7 @@ func (s *security) HandleOAuth2(ctx context.Context, operationName api.Operation
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
-	claims := token.Claims.(jwt.MapClaims)
-	if claims == nil {
-		return nil, fmt.Errorf("missing required claims")
-	}
-
-	if s.debug {
-		fmt.Println("claims", claims)
-	}
-
-	userScopesRaw, ok := claims["scopes"].([]any)
-
-	if !ok {
-		return nil, fmt.Errorf("missing required scopes claim")
-	}
-
-	// Convert []any to []string
-	userScopes := make([]string, 0, len(userScopesRaw))
-	for _, e := range userScopesRaw {
-		if s, ok := e.(string); ok {
-			userScopes = append(userScopes, s)
-		}
-	}
-
-	for _, requiredScope := range t.Scopes {
-		if !slices.Contains(userScopes, requiredScope) {
-			return nil, fmt.Errorf("missing required scope: %s", requiredScope)
-		}
-	}
-
-	return s.mergeClaims(ctx, claims), nil
+	return s.hasValidClaims(ctx, "scopes", t.Scopes, token.Claims.(jwt.MapClaims))
 }
 {{end}}
 
@@ -201,6 +141,47 @@ func (s *security) HandleOpenIdConnect(ctx context.Context, operationName api.Op
 	return ctx, nil
 }
 {{end}}
+
+func (s *security) hasValidClaims(
+	ctx context.Context, claim string, requirements []string, claims jwt.MapClaims,
+) (context.Context, error) {
+	if claims == nil {
+		return nil, fmt.Errorf("missing required claims")
+	}
+
+	if s.debug {
+		fmt.Println("claims", claims)
+	}
+
+	var userValues []string
+	userValuesRaw, ok := claims[claim]
+
+	if !ok {
+		return nil, fmt.Errorf("missing required claim: %s", claim)
+	}
+
+	switch v := userValuesRaw.(type) {
+	case []string:
+		userValues = v
+	case []any:
+		userValues = make([]string, 0, len(v))
+		for _, e := range v {
+			if s, ok := e.(string); ok {
+				userValues = append(userValues, strings.TrimSpace(s))
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unknown assertion type: %s for claim: %s", v, claim)
+	}
+
+	for _, requirement := range requirements {
+		if !slices.Contains(userValues, strings.TrimSpace(requirement)) {
+			return nil, fmt.Errorf("missing requirement: %s", requirement)
+		}
+	}
+
+	return s.mergeClaims(ctx, claims), nil
+}
 
 func (s *security) mergeClaims(ctx context.Context, newClaims jwt.MapClaims) context.Context {
 	// 1. Get existing claims from context
