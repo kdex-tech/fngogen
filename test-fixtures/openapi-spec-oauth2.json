@@ -39,7 +39,7 @@
         "type": "oauth2",
         "flows": {
           "password": {
-            "tokenUrl": "http://sim.docker.localhost/-/token",
+            "tokenUrl": "http://sim.test/-/token",
             "scopes": {
               "users:read": "Read access",
               "users:write": "Write access"
@@ -114,7 +114,7 @@
   },
   "servers": [
     {
-      "url": "http://sim.docker.localhost"
+      "url": "http://sim.test"
     }
   ],
   "tags": [

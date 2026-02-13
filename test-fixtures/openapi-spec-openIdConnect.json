@@ -40,7 +40,7 @@
     "securitySchemes": {
       "openIdConnect": {
         "description": "OpenID Connect",
-        "openIdConnectUrl": "http://sim.docker.localhost/.well-known/openid-configuration",
+        "openIdConnectUrl": "http://sim.test/.well-known/openid-configuration",
         "type": "openIdConnect"
       }
     }
@@ -102,7 +102,7 @@
   },
   "servers": [
     {
-      "url": "http://sim.docker.localhost"
+      "url": "http://sim.test"
     }
   ],
   "tags": [

@@ -154,7 +154,7 @@
   },
   "servers": [
     {
-      "url": "http://sim.docker.localhost"
+      "url": "http://sim.test"
     }
   ],
   "tags": [
