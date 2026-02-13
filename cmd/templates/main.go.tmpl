@@ -43,10 +43,16 @@ type security struct {
 	apiKey            string
 	apiKeyEntitlments []string
 	{{end}}
+	debug bool
 	jwks *keyfunc.JWKS
 }
 
 func NewSecurity() *security {
+	debug := os.Getenv("DEBUG_SECURITY")
+	if debug == "true" {
+		log.Println("Debug mode enabled")
+	}
+
 	jwksURL := os.Getenv("JWKS_URL")
 	if jwksURL == "" {
 		log.Fatal("JWKS_URL environment variable is required for security")
@@ -66,6 +72,7 @@ func NewSecurity() *security {
 	{{end}}
 
 	return &security{
+		debug: debug == "true",
 		jwks: jwks,
 		{{if .APIKeySecurity}}
 		apiKey:            apiKey,
@@ -101,6 +108,10 @@ func (s *security) HandleApikey(ctx context.Context, operationName api.Operation
 		"roles":  s.apiKeyEntitlments,
 	}
 
+	if s.debug {
+		fmt.Println("claims", claims)
+	}
+
 	return s.mergeClaims(ctx, claims), nil
 }
 {{end}}
@@ -113,6 +124,14 @@ func (s *security) HandleBearer(ctx context.Context, operationName api.Operation
 	}
 
 	claims := token.Claims.(jwt.MapClaims)
+	if claims == nil {
+		return nil, fmt.Errorf("missing required claims")
+	}
+
+	if s.debug {
+		fmt.Println("claims", claims)
+	}
+
 	userEntitlements, ok := claims["entitlements"].([]string)
 
 	if !ok {
@@ -137,6 +156,14 @@ func (s *security) HandleOAuth2(ctx context.Context, operationName api.Operation
 	}
 
 	claims := token.Claims.(jwt.MapClaims)
+	if claims == nil {
+		return nil, fmt.Errorf("missing required claims")
+	}
+
+	if s.debug {
+		fmt.Println("claims", claims)
+	}
+
 	userScopes, ok := claims["scopes"].([]string)
 
 	if !ok {
