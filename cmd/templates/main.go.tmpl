@@ -11,12 +11,12 @@ import (
 
 	{{if .Security}}
 	"context"
-	"slices"
 	"strings"
 	"time"
 	"github.com/MicahParks/keyfunc/v2"
 	{{if or .APIKeySecurity .BearerSecurity .OAuth2Security}}
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/kdex-tech/entitlements/entitlements"
 	{{end}}
 	{{end}}
 )
@@ -41,7 +41,9 @@ type security struct {
 	apiKey            string
 	apiKeyEntitlments []string
 	{{end}}
+	checker entitlements.EntitlementsChecker
 	debug bool
+	defaultSecurityScheme string
 	jwks *keyfunc.JWKS
 }
 
@@ -69,13 +71,28 @@ func NewSecurity() *security {
 	apiKeyEntitlments := strings.Split(os.Getenv("API_KEY_ENTITLEMENTS"), ",")
 	{{end}}
 
+	anonymousEntitlements := []string{}
+	anonymousEntitlementsVar := os.Getenv("ANONYMOUS_ENTITLEMENTS")
+	if anonymousEntitlementsVar != "" {
+		for part := range strings.SplitSeq(anonymousEntitlementsVar, ",") {
+			anonymousEntitlements = append(anonymousEntitlements, strings.TrimSpace(part))
+		}
+	}
+
+	defaultSecurityScheme := os.Getenv("DEFAULT_SECURITY_SCHEME")
+	if defaultSecurityScheme == "" {
+		defaultSecurityScheme = "bearer"
+	}
+
 	return &security{
-		debug: debug == "true",
-		jwks: jwks,
 		{{if .APIKeySecurity}}
 		apiKey:            apiKey,
 		apiKeyEntitlments: apiKeyEntitlments,
 		{{end}}
+		debug: debug == "true",
+		checker: *entitlements.NewEntitlementsChecker(anonymousEntitlements, defaultSecurityScheme, false),
+		jwks: jwks,
+		defaultSecurityScheme: defaultSecurityScheme,
 	}
 }
 
@@ -95,22 +112,12 @@ func (s *security) HandleApikey(ctx context.Context, operationName api.Operation
 		return nil, fmt.Errorf("invalid API key")
 	}
 
-	for _, requiredRole := range t.Roles {
-		if !slices.Contains(s.apiKeyEntitlments, requiredRole) {
-			return nil, fmt.Errorf("key does not have required role: %s", requiredRole)
-		}
+	claims := jwt.MapClaims{
+		"sub":   "api-key-subject",
+		"roles": s.apiKeyEntitlments,
 	}
 
-	claims := map[string]any{
-		"apikey": "valid",
-		"roles":  s.apiKeyEntitlments,
-	}
-
-	if s.debug {
-		fmt.Println("claims", claims)
-	}
-
-	return s.mergeClaims(ctx, claims), nil
+	return s.hasValidClaims(ctx, "roles", "apiKey", t.Roles, claims)
 }
 {{end}}
 
@@ -121,7 +128,7 @@ func (s *security) HandleBearer(ctx context.Context, operationName api.Operation
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
-	return s.hasValidClaims(ctx, "entitlements", t.Roles, token.Claims.(jwt.MapClaims))
+	return s.hasValidClaims(ctx, "entitlements", "bearer", t.Roles, token.Claims.(jwt.MapClaims))
 }
 {{end}}
 
@@ -132,18 +139,23 @@ func (s *security) HandleOAuth2(ctx context.Context, operationName api.Operation
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
-	return s.hasValidClaims(ctx, "scopes", t.Scopes, token.Claims.(jwt.MapClaims))
+	return s.hasValidClaims(ctx, "scopes", "oauth2", t.Scopes, token.Claims.(jwt.MapClaims))
 }
 {{end}}
 
 {{if .OpenIdConnectSecurity}}
 func (s *security) HandleOpenIdConnect(ctx context.Context, operationName api.OperationName, t api.OpenIdConnect) (context.Context, error) {
-	return ctx, nil
+	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc)
+	if err != nil || !token.Valid {
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+
+	return s.hasValidClaims(ctx, "scopes", "oidc", t.Scopes, token.Claims.(jwt.MapClaims))
 }
 {{end}}
 
 func (s *security) hasValidClaims(
-	ctx context.Context, claim string, requirements []string, claims jwt.MapClaims,
+	ctx context.Context, claim string, scheme string, requirements []string, claims jwt.MapClaims,
 ) (context.Context, error) {
 	if claims == nil {
 		return nil, fmt.Errorf("missing required claims")
@@ -153,31 +165,38 @@ func (s *security) hasValidClaims(
 		fmt.Println("claims", claims)
 	}
 
-	var userValues []string
-	userValuesRaw, ok := claims[claim]
+	var claimValues []string
+	claimValuesRaw, ok := claims[claim]
 
 	if !ok {
 		return nil, fmt.Errorf("missing required claim: %s", claim)
 	}
 
-	switch v := userValuesRaw.(type) {
+	switch v := claimValuesRaw.(type) {
 	case []string:
-		userValues = v
+		claimValues = v
 	case []any:
-		userValues = make([]string, 0, len(v))
+		claimValues = make([]string, 0, len(v))
 		for _, e := range v {
 			if s, ok := e.(string); ok {
-				userValues = append(userValues, strings.TrimSpace(s))
+				claimValues = append(claimValues, strings.TrimSpace(s))
 			}
 		}
 	default:
 		return nil, fmt.Errorf("unknown assertion type: %s for claim: %s", v, claim)
 	}
 
-	for _, requirement := range requirements {
-		if !slices.Contains(userValues, strings.TrimSpace(requirement)) {
-			return nil, fmt.Errorf("missing requirement: %s", requirement)
-		}
+	ent := entitlements.Entitlements{
+		scheme: claimValues,
+	}
+	req := entitlements.Requirements{
+		map[string][]string{
+			scheme: requirements,
+		},
+	}
+
+	if !s.checker.VerifyEntitlements(ent, req) {
+		return nil, fmt.Errorf("entitlements do not match requirements", ent, req)
 	}
 
 	return s.mergeClaims(ctx, claims), nil
