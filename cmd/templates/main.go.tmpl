@@ -132,10 +132,18 @@ func (s *security) HandleBearer(ctx context.Context, operationName api.Operation
 		fmt.Println("claims", claims)
 	}
 
-	userEntitlements, ok := claims["entitlements"].([]string)
+	userEntitlementsRaw, ok := claims["entitlements"].([]any)
 
 	if !ok {
 		return nil, fmt.Errorf("missing required entitlements claim")
+	}
+
+	// Convert []any to []string
+	userEntitlements := make([]string, 0, len(userEntitlementsRaw))
+	for _, e := range userEntitlementsRaw {
+		if s, ok := e.(string); ok {
+			userEntitlements = append(userEntitlements, s)
+		}
 	}
 
 	for _, requiredRole := range t.Roles {
@@ -164,10 +172,18 @@ func (s *security) HandleOAuth2(ctx context.Context, operationName api.Operation
 		fmt.Println("claims", claims)
 	}
 
-	userScopes, ok := claims["scopes"].([]string)
+	userScopesRaw, ok := claims["scopes"].([]any)
 
 	if !ok {
 		return nil, fmt.Errorf("missing required scopes claim")
+	}
+
+	// Convert []any to []string
+	userScopes := make([]string, 0, len(userScopesRaw))
+	for _, e := range userScopesRaw {
+		if s, ok := e.(string); ok {
+			userScopes = append(userScopes, s)
+		}
 	}
 
 	for _, requiredScope := range t.Scopes {
