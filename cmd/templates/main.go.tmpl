@@ -16,7 +16,7 @@ import (
 	"github.com/MicahParks/keyfunc/v2"
 	{{if or .APIKeySecurity .BearerSecurity .OAuth2Security}}
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/kdex-tech/entitlements/entitlements"
+	"github.com/kdex-tech/entitlements"
 	{{end}}
 	{{end}}
 )
