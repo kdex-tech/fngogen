@@ -196,7 +196,7 @@ func (s *security) hasValidClaims(
 	}
 
 	if !s.checker.VerifyEntitlements(ent, req) {
-		return nil, fmt.Errorf("entitlements do not match requirements", ent, req)
+		return nil, fmt.Errorf("entitlements %v do not match requirements %v", ent, req)
 	}
 
 	return s.mergeClaims(ctx, claims), nil
