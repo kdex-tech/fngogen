@@ -75,7 +75,7 @@ func NewSecurity() *security {
 		log.Fatal("JWKS_URL environment variable is required for security")
 	}
 	jwks, err := keyfunc.Get(jwksURL, keyfunc.Options{
-		RefreshInterval: time.Hour,
+		RefreshInterval: 15 * time.Minute,
 	})
 	if err != nil {
 		log.Fatalf("failed to fetch JWKS from %s: %v", jwksURL, err)
@@ -87,7 +87,7 @@ func NewSecurity() *security {
 		log.Fatal("PASETO_PKS_URL environment variable is required for security")
 	}
 	pks := &pasetoPKs{
-		ttl: time.Hour,
+		ttl: 15 * time.Minute,
 		url: pksURL,
 	}
 	pks.refresh()
