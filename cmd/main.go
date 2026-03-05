@@ -120,24 +120,22 @@ func run(args []string) error {
 	oauth2Security := false
 	openIdConnectSecurity := false
 	if spec["components"] != nil {
-		if components, ok := spec["components"].(map[string]interface{}); ok {
-			if securitySchemes, ok := components["securitySchemes"].(map[string]interface{}); ok {
+		if components, ok := spec["components"].(map[string]any); ok {
+			if securitySchemes, ok := components["securitySchemes"].(map[string]any); ok {
 				if len(securitySchemes) > 0 {
 					security = true
 				}
 				for _, securityScheme := range securitySchemes {
-					if securityScheme.(map[string]interface{})["type"] == "apiKey" {
+					if securityScheme.(map[string]any)["type"] == "apiKey" {
 						apiKeySecurity = true
 					}
-					if securityScheme.(map[string]interface{})["type"] == "http" {
-						if securityScheme.(map[string]interface{})["scheme"] == "bearer" {
-							bearerSecurity = true
-						}
+					if securityScheme.(map[string]any)["type"] == "http" {
+						bearerSecurity = true
 					}
-					if securityScheme.(map[string]interface{})["type"] == "oauth2" {
+					if securityScheme.(map[string]any)["type"] == "oauth2" {
 						oauth2Security = true
 					}
-					if securityScheme.(map[string]interface{})["type"] == "openIdConnect" {
+					if securityScheme.(map[string]any)["type"] == "openIdConnect" {
 						openIdConnectSecurity = true
 					}
 				}
