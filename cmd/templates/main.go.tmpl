@@ -42,20 +42,32 @@ func main() {
 
 {{if .Security}}
 type security struct {
-	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-	pasetoPksURL      string
-	pasetoPublicKeys  map[string]*paseto.V4AsymmetricPublicKey
-	{{end}}
+	audience string
 	checker entitlements.EntitlementsChecker
 	debug bool
 	defaultSecurityScheme string
+	issuer string
 	jwks *keyfunc.JWKS
+	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
+	pksURL      string
+	pasetoPublicKeys  map[string]*paseto.V4AsymmetricPublicKey
+	{{end}}
 }
 
 func NewSecurity() *security {
-	debug := os.Getenv("DEBUG_SECURITY")
+	audience := os.Getenv("AUDIENCE")
+	if audience == "" {
+		log.Fatal("AUDIENCE environment variable is required for security")
+	}
+
+	debug := os.Getenv("DEBUG")
 	if debug == "true" {
 		log.Println("Debug mode enabled")
+	}
+
+	issuer := os.Getenv("ISSUER")
+	if issuer == "" {
+		log.Fatal("ISSUER environment variable is required for security")
 	}
 
 	jwksURL := os.Getenv("JWKS_URL")
@@ -68,22 +80,16 @@ func NewSecurity() *security {
 	if err != nil {
 		log.Fatalf("failed to fetch JWKS from %s: %v", jwksURL, err)
 	}
-	
+
 	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-	pasetoPksURL := os.Getenv("PASETO_PKS_URL")
-	if pasetoPksURL == "" {
+	pksURL := os.Getenv("PKS_URL")
+	if pksURL == "" {
 		log.Fatal("PASETO_PKS_URL environment variable is required for security")
 	}
-	pasetoPublicKeys := fetchPasetoPublicKeys(pasetoPksURL)
+	pasetoPublicKeys := fetchPasetoPublicKeys(pksURL)
 	{{end}}
 
-	anonymousEntitlements := []string{}
-	anonymousEntitlementsVar := os.Getenv("ANONYMOUS_ENTITLEMENTS")
-	if anonymousEntitlementsVar != "" {
-		for part := range strings.SplitSeq(anonymousEntitlementsVar, ",") {
-			anonymousEntitlements = append(anonymousEntitlements, strings.TrimSpace(part))
-		}
-	}
+	anonymousEntitlements := strings.Fields(os.Getenv("ANONYMOUS_ENTITLEMENTS"))
 
 	defaultSecurityScheme := os.Getenv("DEFAULT_SECURITY_SCHEME")
 	if defaultSecurityScheme == "" {
@@ -91,14 +97,16 @@ func NewSecurity() *security {
 	}
 
 	return &security{
+		audience: audience,
+		checker: *entitlements.NewEntitlementsChecker(anonymousEntitlements, defaultSecurityScheme, false),
+		debug: debug == "true",
+		defaultSecurityScheme: defaultSecurityScheme,
+		issuer: issuer,
+		jwks: jwks,
 		{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-		pasetoPksURL:      pasetoPksURL,
+		pksURL:      pksURL,
 		pasetoPublicKeys:  pasetoPublicKeys,
 		{{end}}
-		debug: debug == "true",
-		checker: *entitlements.NewEntitlementsChecker(anonymousEntitlements, defaultSecurityScheme, false),
-		jwks: jwks,
-		defaultSecurityScheme: defaultSecurityScheme,
 	}
 }
 
@@ -149,24 +157,24 @@ const (
 
 {{if .APIKeyCookieSecurity}}
 func (s *security) HandleApiKeyCookie(ctx context.Context, operationName api.OperationName, t api.ApiKeyCookie) (context.Context, error) {
-	return s.handleApiKey(ctx, operationName, t.APIKey, t.Roles)
+	return s.handleApiKey(ctx, operationName, "apiKeyCookie", t.APIKey, t.Roles)
 }
 {{end}}
 
 {{if .APIKeyHeaderSecurity}}
 func (s *security) HandleApiKeyHeader(ctx context.Context, operationName api.OperationName, t api.ApiKeyHeader) (context.Context, error) {
-	return s.handleApiKey(ctx, operationName, t.APIKey, t.Roles)
+	return s.handleApiKey(ctx, operationName, "apiKeyHeader", t.APIKey, t.Roles)
 }
 {{end}}
 
 {{if .APIKeyQuerySecurity}}
 func (s *security) HandleApiKeyQuery(ctx context.Context, operationName api.OperationName, t api.ApiKeyQuery) (context.Context, error) {
-	return s.handleApiKey(ctx, operationName, t.APIKey, t.Roles)
+	return s.handleApiKey(ctx, operationName, "apiKeyQuery", t.APIKey, t.Roles)
 }
 {{end}}
 
 {{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-func (s *security) handleApiKey(ctx context.Context, operationName api.OperationName, tokenString string, roles []string) (context.Context, error) {
+func (s *security) handleApiKey(ctx context.Context, operationName api.OperationName, scheme string, tokenString string, roles []string) (context.Context, error) {
 	parser := paseto.NewParser()
 	footerBytes, err := parser.UnsafeParseFooter(paseto.V4Public, tokenString)
 	if err != nil {
@@ -182,7 +190,7 @@ func (s *security) handleApiKey(ctx context.Context, operationName api.Operation
 
 	pubKey, ok := s.pasetoPublicKeys[footerData.KID]
 	if !ok {
-		s.pasetoPublicKeys = fetchPasetoPublicKeys(s.pasetoPksURL)
+		s.pasetoPublicKeys = fetchPasetoPublicKeys(s.pksURL)
 		pubKey, ok = s.pasetoPublicKeys[footerData.KID]
 		if !ok {
 			return nil, fmt.Errorf("unknown key ID: %s", footerData.KID)
@@ -191,12 +199,8 @@ func (s *security) handleApiKey(ctx context.Context, operationName api.Operation
 
 	parser.AddRule(paseto.NotExpired())
 	parser.AddRule(paseto.ValidAt(time.Now()))
-	if aud := os.Getenv("PASETO_AUDIENCE"); aud != "" {
-		parser.AddRule(paseto.ForAudience(aud))
-	}
-	if iss := os.Getenv("PASETO_ISSUER"); iss != "" {
-		parser.AddRule(paseto.IssuedBy(iss))
-	}
+	parser.AddRule(paseto.ForAudience(s.audience))
+	parser.AddRule(paseto.IssuedBy(s.issuer))
 
 	token, err := parser.ParseV4Public(*pubKey, tokenString, nil)
 	if err != nil {
@@ -207,18 +211,14 @@ func (s *security) handleApiKey(ctx context.Context, operationName api.Operation
 	for k, v := range token.Claims() {
 		claims[k] = v
 	}
-	sub, _ := token.GetSubject()
-	claims["sub"] = sub
-	scp, _ := token.GetString("scp")
-	claims["scp"] = strings.Fields(scp)
 
-	return s.hasValidClaims(ctx, "scp", "apiKey", roles, claims)
+	return s.hasValidClaims(ctx, "scp", scheme, roles, claims)
 }
 {{end}}
 
 {{if .BearerSecurity}}
 func (s *security) HandleBearer(ctx context.Context, operationName api.OperationName, t api.Bearer) (context.Context, error) {
-	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc)
+	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc, jwt.WithAudience(s.audience), jwt.WithIssuer(s.issuer))
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
@@ -229,7 +229,7 @@ func (s *security) HandleBearer(ctx context.Context, operationName api.Operation
 
 {{if .OAuth2Security}}	
 func (s *security) HandleOAuth2(ctx context.Context, operationName api.OperationName, t api.OAuth2) (context.Context, error) {
-	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc)
+	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc, jwt.WithAudience(s.audience), jwt.WithIssuer(s.issuer))
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
@@ -240,7 +240,7 @@ func (s *security) HandleOAuth2(ctx context.Context, operationName api.Operation
 
 {{if .OpenIdConnectSecurity}}
 func (s *security) HandleOpenIdConnect(ctx context.Context, operationName api.OperationName, t api.OpenIdConnect) (context.Context, error) {
-	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc)
+	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc, jwt.WithAudience(s.audience), jwt.WithIssuer(s.issuer))
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
@@ -260,6 +260,11 @@ func (s *security) hasValidClaims(
 		fmt.Println("[DEBUG] claims", claims)
 	}
 
+	_, ok := claims["sub"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing required claim: sub")
+	}
+
 	var claimValues []string
 	claimValuesRaw, ok := claims[claim]
 
@@ -268,6 +273,8 @@ func (s *security) hasValidClaims(
 	}
 
 	switch v := claimValuesRaw.(type) {
+	case string:
+		claimValues = strings.Fields(v)
 	case []string:
 		claimValues = v
 	case []any:
