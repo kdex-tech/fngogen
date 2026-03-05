@@ -257,7 +257,7 @@ func (s *security) hasValidClaims(
 	}
 
 	if s.debug {
-		fmt.Println("claims", claims)
+		fmt.Println("[DEBUG] claims", claims)
 	}
 
 	var claimValues []string
@@ -288,6 +288,11 @@ func (s *security) hasValidClaims(
 		map[string][]string{
 			scheme: requirements,
 		},
+	}
+
+	if s.debug {
+		fmt.Println("[DEBUG] entitlements", ent)
+		fmt.Println("[DEBUG] requirements", req)
 	}
 
 	if !s.checker.VerifyEntitlements(ent, req) {
