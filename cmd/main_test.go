@@ -56,9 +56,19 @@ func Test_run(t *testing.T) {
 			workDir: "t5",
 		},
 		{
-			name:    "with apiKey security",
-			openapi: `../../test-fixtures/openapi-spec-apikey.json`,
+			name:    "with apiKey security - cookie",
+			openapi: `../../test-fixtures/openapi-spec-apikey-cookie.json`,
 			workDir: "t6",
+		},
+		{
+			name:    "with apiKey security - header",
+			openapi: `../../test-fixtures/openapi-spec-apikey-header.json`,
+			workDir: "t7",
+		},
+		{
+			name:    "with apiKey security - query",
+			openapi: `../../test-fixtures/openapi-spec-apikey-query.json`,
+			workDir: "t8",
 		},
 		// OpenID Connect security is not implemented yet in ogen
 		// {

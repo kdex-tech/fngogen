@@ -19,9 +19,10 @@ var _ api.Handler = (*defaultHandler)(nil)
 {{range .Methods}}
 func (dh *defaultHandler) {{.Name}}({{.FullParams}}) {{.Returns}} {
 	{{- if $.Security}}
-	userClaims := ctx.Value(UserContextKey).(jwt.MapClaims)
-	userId, _ := userClaims.GetSubject()
-	_, _ = fmt.Println("Executing function:", "{{.Name}}", ", user id:", userId, ", all user claims:", userClaims)
+	if userClaims, ok := ctx.Value(UserContextKey).(jwt.MapClaims); ok {
+		userId, _ := userClaims.GetSubject()
+		_, _ = fmt.Println("Executing function:", "{{.Name}}", ", user id:", userId, ", all user claims:", userClaims)
+	}
 	{{end}}
 	return nil, fmt.Errorf("not implemented")
 }

@@ -2,9 +2,10 @@ module github.com/kdex-tech/fngogen
 
 go 1.26.0
 
-require github.com/Masterminds/sprig/v3 v3.3.0
-
-require github.com/stretchr/testify v1.11.1
+require (
+	github.com/Masterminds/sprig/v3 v3.3.0
+	github.com/stretchr/testify v1.11.1
+)
 
 require (
 	dario.cat/mergo v1.0.2 // indirect

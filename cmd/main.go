@@ -30,7 +30,9 @@ type MethodData struct {
 }
 
 type TemplateData struct {
-	APIKeySecurity        bool
+	APIKeyCookieSecurity  bool
+	APIKeyHeaderSecurity  bool
+	APIKeyQuerySecurity   bool
 	BearerSecurity        bool
 	Methods               []MethodData
 	OAuth2Security        bool
@@ -115,7 +117,9 @@ func run(args []string) error {
 	}
 
 	security := false
-	apiKeySecurity := false
+	apiKeyCookieSecurity := false
+	apiKeyHeaderSecurity := false
+	apiKeyQuerySecurity := false
 	bearerSecurity := false
 	oauth2Security := false
 	openIdConnectSecurity := false
@@ -127,7 +131,15 @@ func run(args []string) error {
 				}
 				for _, securityScheme := range securitySchemes {
 					if securityScheme.(map[string]any)["type"] == "apiKey" {
-						apiKeySecurity = true
+						if securityScheme.(map[string]any)["in"] == "cookie" {
+							apiKeyCookieSecurity = true
+						}
+						if securityScheme.(map[string]any)["in"] == "header" {
+							apiKeyHeaderSecurity = true
+						}
+						if securityScheme.(map[string]any)["in"] == "query" {
+							apiKeyQuerySecurity = true
+						}
 					}
 					if securityScheme.(map[string]any)["type"] == "http" {
 						bearerSecurity = true
@@ -144,7 +156,9 @@ func run(args []string) error {
 	}
 
 	templateData := TemplateData{
-		APIKeySecurity:        apiKeySecurity,
+		APIKeyCookieSecurity:  apiKeyCookieSecurity,
+		APIKeyHeaderSecurity:  apiKeyHeaderSecurity,
+		APIKeyQuerySecurity:   apiKeyQuerySecurity,
 		BearerSecurity:        bearerSecurity,
 		Methods:               methods,
 		OAuth2Security:        oauth2Security,

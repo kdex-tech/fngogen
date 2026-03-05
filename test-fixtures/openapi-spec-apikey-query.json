@@ -35,10 +35,10 @@
       }
     },
     "securitySchemes": {
-      "apikey": {
+      "apiKeyQuery": {
         "type": "apiKey",
-        "in": "header",
-        "name": "X-API-Key"
+        "in": "query",
+        "name": "api_token"
       }
     }
   },
@@ -88,7 +88,7 @@
         },
         "security": [
           {
-            "apikey": []
+            "apiKeyQuery": []
           }
         ],
         "summary": "gen-v1-users-id-put",

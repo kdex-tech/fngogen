@@ -14,7 +14,12 @@ import (
 	"strings"
 	"time"
 	"github.com/MicahParks/keyfunc/v2"
-	{{if or .APIKeySecurity .BearerSecurity .OAuth2Security}}
+	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
+	"encoding/base64"
+	"encoding/json"
+	"aidanwoods.dev/go-paseto"
+	{{end}}
+	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity .BearerSecurity .OAuth2Security}}
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/kdex-tech/entitlements"
 	{{end}}
@@ -37,9 +42,9 @@ func main() {
 
 {{if .Security}}
 type security struct {
-	{{if .APIKeySecurity}}
-	apiKey            string
-	apiKeyEntitlments []string
+	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
+	pasetoPksURL      string
+	pasetoPublicKeys  map[string]*paseto.V4AsymmetricPublicKey
 	{{end}}
 	checker entitlements.EntitlementsChecker
 	debug bool
@@ -63,12 +68,13 @@ func NewSecurity() *security {
 	if err != nil {
 		log.Fatalf("failed to fetch JWKS from %s: %v", jwksURL, err)
 	}
-	{{if .APIKeySecurity}}
-	apiKey := os.Getenv("API_KEY")
-	if apiKey == "" {
-		log.Fatal("API_KEY environment variable is required for security")
+	
+	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
+	pasetoPksURL := os.Getenv("PASETO_PKS_URL")
+	if pasetoPksURL == "" {
+		log.Fatal("PASETO_PKS_URL environment variable is required for security")
 	}
-	apiKeyEntitlments := strings.Split(os.Getenv("API_KEY_ENTITLEMENTS"), ",")
+	pasetoPublicKeys := fetchPasetoPublicKeys(pasetoPksURL)
 	{{end}}
 
 	anonymousEntitlements := []string{}
@@ -85,9 +91,9 @@ func NewSecurity() *security {
 	}
 
 	return &security{
-		{{if .APIKeySecurity}}
-		apiKey:            apiKey,
-		apiKeyEntitlments: apiKeyEntitlments,
+		{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
+		pasetoPksURL:      pasetoPksURL,
+		pasetoPublicKeys:  pasetoPublicKeys,
 		{{end}}
 		debug: debug == "true",
 		checker: *entitlements.NewEntitlementsChecker(anonymousEntitlements, defaultSecurityScheme, false),
@@ -96,28 +102,117 @@ func NewSecurity() *security {
 	}
 }
 
-// ContextKey is a custom type for context keys to avoid collisions.
+{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
+func fetchPasetoPublicKeys(url string) map[string]*paseto.V4AsymmetricPublicKey {
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("failed to fetch PASETO public keys from %s: %v", url, err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Keys []struct {
+			KID string `json:"kid"`
+			Key string `json:"key"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		log.Printf("failed to decode PASETO public keys: %v", err)
+		return nil
+	}
+
+	keys := make(map[string]*paseto.V4AsymmetricPublicKey)
+	for _, k := range data.Keys {
+		keyStr := strings.TrimPrefix(k.Key, "k4.public.")
+		pubBytes, err := base64.RawURLEncoding.DecodeString(keyStr)
+		if err != nil {
+			log.Printf("failed to decode PASETO public key %s: %v", k.KID, err)
+			continue
+		}
+		pubKey, err := paseto.NewV4AsymmetricPublicKeyFromBytes(pubBytes)
+		if err != nil {
+			log.Printf("failed to parse PASETO public key %s: %v", k.KID, err)
+			continue
+		}
+		keys[k.KID] = &pubKey
+	}
+	return keys
+}
+{{end}}
+
 type ContextKey string
 
 const (
-	// UserContextKey is the key used to store the user claims in the context.
 	UserContextKey ContextKey = "user"
 )
 
-{{if .APIKeySecurity}}
-func (s *security) HandleApikey(ctx context.Context, operationName api.OperationName, t api.Apikey) (context.Context, error) {
-	key := t.APIKey
+{{if .APIKeyCookieSecurity}}
+func (s *security) HandleApiKeyCookie(ctx context.Context, operationName api.OperationName, t api.ApiKeyCookie) (context.Context, error) {
+	return s.handleApiKey(ctx, operationName, t.APIKey, t.Roles)
+}
+{{end}}
 
-	if key != s.apiKey {
-		return nil, fmt.Errorf("invalid API key")
+{{if .APIKeyHeaderSecurity}}
+func (s *security) HandleApiKeyHeader(ctx context.Context, operationName api.OperationName, t api.ApiKeyHeader) (context.Context, error) {
+	return s.handleApiKey(ctx, operationName, t.APIKey, t.Roles)
+}
+{{end}}
+
+{{if .APIKeyQuerySecurity}}
+func (s *security) HandleApiKeyQuery(ctx context.Context, operationName api.OperationName, t api.ApiKeyQuery) (context.Context, error) {
+	return s.handleApiKey(ctx, operationName, t.APIKey, t.Roles)
+}
+{{end}}
+
+{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
+func (s *security) handleApiKey(ctx context.Context, operationName api.OperationName, tokenString string, roles []string) (context.Context, error) {
+	parser := paseto.NewParser()
+	footerBytes, err := parser.UnsafeParseFooter(paseto.V4Public, tokenString)
+	if err != nil {
+		return nil, fmt.Errorf("invalid token footer: %w", err)
 	}
 
-	claims := jwt.MapClaims{
-		"sub":   "api-key-subject",
-		"roles": s.apiKeyEntitlments,
+	var footerData struct {
+		KID string `json:"kid"`
+	}
+	if err := json.Unmarshal(footerBytes, &footerData); err != nil {
+		return nil, fmt.Errorf("invalid footer JSON: %w", err)
 	}
 
-	return s.hasValidClaims(ctx, "roles", "apiKey", t.Roles, claims)
+	pubKey, ok := s.pasetoPublicKeys[footerData.KID]
+	if !ok {
+		s.pasetoPublicKeys = fetchPasetoPublicKeys(s.pasetoPksURL)
+		pubKey, ok = s.pasetoPublicKeys[footerData.KID]
+		if !ok {
+			return nil, fmt.Errorf("unknown key ID: %s", footerData.KID)
+		}
+	}
+
+	parser.AddRule(paseto.NotExpired())
+	parser.AddRule(paseto.ValidAt(time.Now()))
+	if aud := os.Getenv("PASETO_AUDIENCE"); aud != "" {
+		parser.AddRule(paseto.ForAudience(aud))
+	}
+	if iss := os.Getenv("PASETO_ISSUER"); iss != "" {
+		parser.AddRule(paseto.IssuedBy(iss))
+	}
+
+	token, err := parser.ParseV4Public(*pubKey, tokenString, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate PASETO: %w", err)
+	}
+
+	claims := jwt.MapClaims{}
+	for k, v := range token.Claims() {
+		claims[k] = v
+	}
+	sub, _ := token.GetSubject()
+	claims["sub"] = sub
+	scp, _ := token.GetString("scp")
+	claims["scp"] = strings.Fields(scp)
+
+	return s.hasValidClaims(ctx, "scp", "apiKey", roles, claims)
 }
 {{end}}
 
@@ -183,7 +278,7 @@ func (s *security) hasValidClaims(
 			}
 		}
 	default:
-		return nil, fmt.Errorf("unknown assertion type: %s for claim: %s", v, claim)
+		return nil, fmt.Errorf("unknown assertion type: %T for claim: %s", v, claim)
 	}
 
 	ent := entitlements.Entitlements{
@@ -203,23 +298,17 @@ func (s *security) hasValidClaims(
 }
 
 func (s *security) mergeClaims(ctx context.Context, newClaims jwt.MapClaims) context.Context {
-	// 1. Get existing claims from context
 	claims, ok := ctx.Value(UserContextKey).(jwt.MapClaims)
 	if !ok {
 		claims = jwt.MapClaims{}
 	}
-	// 2. Merge new values into existing map
 	for k, v := range newClaims {
-		// Special handling for merging slices (like roles or scopes)
 		if existingSlice, isSlice := claims[k].([]string); isSlice {
 			if newSlice, ok := v.([]string); ok {
-				// Combine and deduplicate if necessary
 				claims[k] = append(existingSlice, newSlice...)
 				continue
 			}
 		}
-
-		// Default: Overwrite specific keys but keep other keys intact
 		claims[k] = v
 	}
 	return context.WithValue(ctx, UserContextKey, claims)
