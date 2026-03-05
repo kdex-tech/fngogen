@@ -15,9 +15,10 @@ import (
 	"time"
 	"github.com/MicahParks/keyfunc/v2"
 	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
+	"aidanwoods.dev/go-paseto"
 	"encoding/base64"
 	"encoding/json"
-	"aidanwoods.dev/go-paseto"
+	"sync"
 	{{end}}
 	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity .BearerSecurity .OAuth2Security}}
 	"github.com/golang-jwt/jwt/v5"
@@ -49,8 +50,7 @@ type security struct {
 	issuer string
 	jwks *keyfunc.JWKS
 	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-	pksURL      string
-	pasetoPublicKeys  map[string]*paseto.V4AsymmetricPublicKey
+	pks *pasetoPKs
 	{{end}}
 }
 
@@ -86,7 +86,12 @@ func NewSecurity() *security {
 	if pksURL == "" {
 		log.Fatal("PASETO_PKS_URL environment variable is required for security")
 	}
-	pasetoPublicKeys := fetchPasetoPublicKeys(pksURL)
+	pks := &pasetoPKs{
+		ttl: time.Hour,
+		url: pksURL,
+	}
+	pks.refresh()
+	go pks.refreshLoop()
 	{{end}}
 
 	anonymousEntitlements := strings.Fields(os.Getenv("ANONYMOUS_ENTITLEMENTS"))
@@ -104,18 +109,46 @@ func NewSecurity() *security {
 		issuer: issuer,
 		jwks: jwks,
 		{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-		pksURL:      pksURL,
-		pasetoPublicKeys:  pasetoPublicKeys,
+		pks: pks,
 		{{end}}
 	}
 }
 
 {{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-func fetchPasetoPublicKeys(url string) map[string]*paseto.V4AsymmetricPublicKey {
-	resp, err := http.Get(url)
+type pasetoPKs struct {
+	expiry time.Time
+	keys   map[string]*paseto.V4AsymmetricPublicKey
+	mu     sync.RWMutex
+	ttl    time.Duration
+	url    string
+}
+
+func (p *pasetoPKs) Get(kid string) (*paseto.V4AsymmetricPublicKey, bool) {
+	p.mu.RLock()
+	key, ok := p.keys[kid]
+	fresh := time.Now().Before(p.expiry)
+	p.mu.RUnlock()
+
+	if ok && fresh {
+		return key, true
+	}
+
+	p.refresh()
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	key, ok = p.keys[kid]
+	return key, ok
+}
+
+func (p *pasetoPKs) refresh() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	resp, err := http.Get(p.url)
 	if err != nil {
-		log.Printf("failed to fetch PASETO public keys from %s: %v", url, err)
-		return nil
+		log.Printf("failed to fetch PASETO public keys from %s: %v", p.url, err)
+		return
 	}
 	defer resp.Body.Close()
 
@@ -127,7 +160,7 @@ func fetchPasetoPublicKeys(url string) map[string]*paseto.V4AsymmetricPublicKey 
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		log.Printf("failed to decode PASETO public keys: %v", err)
-		return nil
+		return
 	}
 
 	keys := make(map[string]*paseto.V4AsymmetricPublicKey)
@@ -145,7 +178,16 @@ func fetchPasetoPublicKeys(url string) map[string]*paseto.V4AsymmetricPublicKey 
 		}
 		keys[k.KID] = &pubKey
 	}
-	return keys
+	p.keys = keys
+	p.expiry = time.Now().Add(p.ttl)
+}
+
+func (p *pasetoPKs) refreshLoop() {
+	ticker := time.NewTicker(p.ttl)
+	defer ticker.Stop()
+	for range ticker.C {
+		p.refresh()
+	}
 }
 {{end}}
 
@@ -188,13 +230,9 @@ func (s *security) handleApiKey(ctx context.Context, operationName api.Operation
 		return nil, fmt.Errorf("invalid footer JSON: %w", err)
 	}
 
-	pubKey, ok := s.pasetoPublicKeys[footerData.KID]
+	pubKey, ok := s.pks.Get(footerData.KID)
 	if !ok {
-		s.pasetoPublicKeys = fetchPasetoPublicKeys(s.pksURL)
-		pubKey, ok = s.pasetoPublicKeys[footerData.KID]
-		if !ok {
-			return nil, fmt.Errorf("unknown key ID: %s", footerData.KID)
-		}
+		return nil, fmt.Errorf("unknown key ID: %s", footerData.KID)
 	}
 
 	parser.AddRule(paseto.NotExpired())
