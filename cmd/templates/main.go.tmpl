@@ -22,7 +22,7 @@ import (
 	{{end}}
 	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity .BearerSecurity .OAuth2Security}}
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/kdex-tech/entitlements"
+	"github.com/kdex-tech/entitlements/go"
 	{{end}}
 	{{end}}
 )
