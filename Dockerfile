@@ -48,4 +48,16 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags
 COPY entry-point.sh /usr/local/bin/entry-point.sh
 RUN chmod 777 /usr/local/bin/entry-point.sh
 
+# The `go mod download` + `go install ogen` build steps above run as
+# root and populate /tmp/go/pkg/mod (the module download cache) and
+# /tmp/.cache/go-build (the build cache) with root-owned subtrees.
+# At runtime the codegen Job runs this image as UID 65532, which can
+# READ the cached entries but cannot ADD new ones — every additional
+# dependency that ogen / `go generate` needs (goleak, yaml.v3, etc.)
+# fails with "permission denied" on the parent directory.
+# Make the entire cache tree world-writable so any UID can extend it.
+# Safe: the image is read-only-by-convention and the cache content
+# isn't security-sensitive. See kdex-tech/fngogen#1.
+RUN chmod -R 0777 /tmp/.cache /tmp/go
+
 ENTRYPOINT ["/usr/local/bin/entry-point.sh"]
