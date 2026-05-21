@@ -7,12 +7,22 @@ RUN apk add --no-cache tree
 
 # Default HOME is / (root-owned). Codegen Jobs run this image as a
 # non-root user (UID 65532 under host-manager's PSSRestricted pod
-# spec); Go's GOCACHE/GOPATH defaults derive from HOME, so without
-# this every `go run` / `go generate` from entry-point.sh fails with
+# spec); Go's GOCACHE default derives from HOME, so without this
+# every `go run` / `go generate` from entry-point.sh fails with
 # "failed to initialize build cache at /.cache/go-build: mkdir
 # /.cache: permission denied". /tmp is always writable. See
 # kdex-tech/fngogen#1.
+#
+# The golang:*-alpine base image hardcodes GOPATH=/go and pre-creates
+# /go (root-owned). The module download cache lives at
+# $GOPATH/pkg/mod/cache, and the sum-db lookaside at $GOPATH/pkg/sumdb,
+# so redirect GOPATH to /tmp/go too — otherwise `go mod download`
+# fails with "mkdir /go/pkg/mod/cache/...: permission denied" and
+# sum-db verification with "open /go/pkg/sumdb/sum.golang.org/latest:
+# permission denied". GOPATH inherits from / -derived defaults if
+# unset, so the override has to be explicit.
 ENV HOME=/tmp
+ENV GOPATH=/tmp/go
 
 WORKDIR /
 # Copy the Go Modules manifests
