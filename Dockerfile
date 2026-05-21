@@ -5,6 +5,15 @@ ARG TARGETARCH
 
 RUN apk add --no-cache tree
 
+# Default HOME is / (root-owned). Codegen Jobs run this image as a
+# non-root user (UID 65532 under host-manager's PSSRestricted pod
+# spec); Go's GOCACHE/GOPATH defaults derive from HOME, so without
+# this every `go run` / `go generate` from entry-point.sh fails with
+# "failed to initialize build cache at /.cache/go-build: mkdir
+# /.cache: permission denied". /tmp is always writable. See
+# kdex-tech/fngogen#1.
+ENV HOME=/tmp
+
 WORKDIR /
 # Copy the Go Modules manifests
 COPY go.mod go.mod
