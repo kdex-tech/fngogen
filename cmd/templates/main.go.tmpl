@@ -74,11 +74,16 @@ func NewSecurity() *security {
 	if jwksURL == "" {
 		log.Fatal("JWKS_URL environment variable is required for security")
 	}
-	jwks, err := keyfunc.Get(jwksURL, keyfunc.Options{
-		RefreshInterval: 15 * time.Minute,
-	})
+	// Knative Revisions are immutable: a single log.Fatalf during a
+	// transient host startup race (e.g. host-manager still initializing
+	// when this Revision rolls) permanently poisons the Revision and
+	// requires a manual DEPLOY_NONCE bump on the KDexFunction to recover.
+	// Retry with exponential backoff to absorb the common bad-window —
+	// host-manager init typically completes in ~10s, well under the
+	// ~63s the schedule below covers.
+	jwks, err := fetchJWKSWithBackoff(jwksURL)
 	if err != nil {
-		log.Fatalf("failed to fetch JWKS from %s: %v", jwksURL, err)
+		log.Fatalf("failed to fetch JWKS from %s after retries: %v", jwksURL, err)
 	}
 
 	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
@@ -111,6 +116,39 @@ func NewSecurity() *security {
 		{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
 		pks: pks,
 		{{end}}
+	}
+}
+
+// fetchJWKSWithBackoff calls keyfunc.Get with exponential backoff (1s, 2s,
+// 4s, 8s, 16s, 32s — ~63s cumulative). It returns the first successful
+// JWKS or the last error after maxAttempts. This is the startup-only
+// retry; once jwks is built, keyfunc handles periodic refresh internally
+// per RefreshInterval below.
+//
+// Note: this function deliberately avoids less-than / greater-than
+// comparison operators because fngogen renders this template with
+// html/template, which would HTML-escape them and break the generated
+// Go source. Use equality/inequality only.
+func fetchJWKSWithBackoff(jwksURL string) (*keyfunc.JWKS, error) {
+	const maxAttempts = 6
+	backoff := time.Second
+	var lastErr error
+	attempt := 1
+	for {
+		jwks, err := keyfunc.Get(jwksURL, keyfunc.Options{
+			RefreshInterval: 15 * time.Minute,
+		})
+		if err == nil {
+			return jwks, nil
+		}
+		lastErr = err
+		if attempt == maxAttempts {
+			return nil, lastErr
+		}
+		log.Printf("JWKS fetch attempt %d of %d from %s failed: %v - retrying in %s", attempt, maxAttempts, jwksURL, err, backoff)
+		time.Sleep(backoff)
+		backoff *= 2
+		attempt++
 	}
 }
 
