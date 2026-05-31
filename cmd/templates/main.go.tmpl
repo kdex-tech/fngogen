@@ -51,6 +51,7 @@ type security struct {
 	jwks *keyfunc.JWKS
 	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
 	pks *pasetoPKs
+	tokenPrefix string
 	{{end}}
 }
 
@@ -97,6 +98,11 @@ func NewSecurity() *security {
 	}
 	pks.refresh()
 	go pks.refreshLoop()
+
+	// PASETO_TOKEN_PREFIX is the host's white-label prefix. When set, the host
+	// minted API tokens with the "v4.public." header replaced by it; we restore
+	// the header before parsing. Empty (the default) means bare tokens.
+	tokenPrefix := os.Getenv("PASETO_TOKEN_PREFIX")
 	{{end}}
 
 	anonymousEntitlements := strings.Fields(os.Getenv("ANONYMOUS_ENTITLEMENTS"))
@@ -115,6 +121,7 @@ func NewSecurity() *security {
 		jwks: jwks,
 		{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
 		pks: pks,
+		tokenPrefix: tokenPrefix,
 		{{end}}
 	}
 }
@@ -255,6 +262,15 @@ func (s *security) HandleApiKeyQuery(ctx context.Context, operationName api.Oper
 
 {{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
 func (s *security) handleApiKey(ctx context.Context, operationName api.OperationName, scheme string, tokenString string, roles []string) (context.Context, error) {
+	// White-label: the host may have replaced the PASETO "v4.public." header
+	// with its brand prefix (PASETO_TOKEN_PREFIX). Restore the header before
+	// parsing so the signature verifies. A token that already starts with
+	// "v4.public." is bare and left untouched; anything else carrying the
+	// configured prefix has it swapped back for the header.
+	if s.tokenPrefix != "" && !strings.HasPrefix(tokenString, "v4.public.") && strings.HasPrefix(tokenString, s.tokenPrefix) {
+		tokenString = "v4.public." + tokenString[len(s.tokenPrefix):]
+	}
+
 	parser := paseto.NewParser()
 	footerBytes, err := parser.UnsafeParseFooter(paseto.V4Public, tokenString)
 	if err != nil {
