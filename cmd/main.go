@@ -57,6 +57,25 @@ func main() {
 }
 
 func run(args []string) error {
+	// Subcommand dispatch. A bare `fngogen --spec ...` (flags first, no
+	// subcommand) stays on the legacy template step so the image's
+	// entry-point.sh contract is unchanged.
+	if len(args) > 0 {
+		switch args[0] {
+		case "local":
+			return runLocal(args[1:])
+		case "build-spec":
+			return runBuildSpec(args[1:])
+		}
+	}
+	return runTemplates(args)
+}
+
+// runTemplates is the legacy template-generation step, invoked by the image's
+// entry-point.sh as `fngogen --spec openapi-spec.json`: it reads the
+// ogen-generated api/oas_server_gen.go Handler interface and renders
+// cmd/{main,default,custom}.go. Preserved for backward compatibility.
+func runTemplates(args []string) error {
 	flags := flag.NewFlagSet("app", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	targetPtr := flags.String("target", "cmd", "the target directory to generate the code")
@@ -66,8 +85,16 @@ func run(args []string) error {
 		return err
 	}
 
+	return generateTemplates("api/oas_server_gen.go", *specPtr, *targetPtr)
+}
+
+// generateTemplates renders cmd/{main,default,custom}.go from the ogen-generated
+// Handler interface at apiServerGenPath and the resolved spec at specPath, into
+// targetDir. Shared by the legacy `fngogen --spec` path and the `fngogen local`
+// pipeline.
+func generateTemplates(apiServerGenPath, specPath, targetDir string) error {
 	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, "api/oas_server_gen.go", nil, parser.ParseComments)
+	node, err := parser.ParseFile(fset, apiServerGenPath, nil, parser.ParseComments)
 	if err != nil {
 		return err
 	}
@@ -102,11 +129,11 @@ func run(args []string) error {
 	})
 
 	// read the openapi spec to check for all the security schemes implemented
-	if _, err := os.Stat(*specPtr); err != nil {
+	if _, err := os.Stat(specPath); err != nil {
 		return err
 	}
 
-	content, err := os.ReadFile(*specPtr)
+	content, err := os.ReadFile(specPath)
 	if err != nil {
 		return err
 	}
@@ -166,19 +193,19 @@ func run(args []string) error {
 		Security:              security,
 	}
 
-	if _, err := os.Stat(*targetPtr); err != nil {
-		if err := os.MkdirAll(*targetPtr, 0755); err != nil {
+	if _, err := os.Stat(targetDir); err != nil {
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
 			return err
 		}
 	}
 
-	if err := generateSourceFile(mainTemplate, templateData, *targetPtr, "main.go", true); err != nil {
+	if err := generateSourceFile(mainTemplate, templateData, targetDir, "main.go", true); err != nil {
 		return err
 	}
-	if err := generateSourceFile(defaultTemplate, templateData, *targetPtr, "default.go", true); err != nil {
+	if err := generateSourceFile(defaultTemplate, templateData, targetDir, "default.go", true); err != nil {
 		return err
 	}
-	if err := generateSourceFile(customTemplate, templateData, *targetPtr, "custom.go", false); err != nil {
+	if err := generateSourceFile(customTemplate, templateData, targetDir, "custom.go", false); err != nil {
 		return err
 	}
 
