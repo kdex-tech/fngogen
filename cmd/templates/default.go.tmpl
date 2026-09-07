@@ -24,6 +24,10 @@ func (dh *defaultHandler) {{.Name}}({{.FullParams}}) {{.Returns}} {
 		_, _ = fmt.Println("Executing function:", "{{.Name}}", ", user id:", userId, ", all user claims:", userClaims)
 	}
 	{{end}}
+	{{- if .ReturnsError}}
+	return fmt.Errorf("not implemented")
+	{{- else}}
 	return nil, fmt.Errorf("not implemented")
+	{{- end}}
 }
 {{end}}

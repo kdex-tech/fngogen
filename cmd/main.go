@@ -27,6 +27,11 @@ type MethodData struct {
 	FullParams string // e.g., "ctx context.Context, req api.OptUser"
 	ParamNames string // e.g., "ctx, req"
 	Returns    string // e.g., "(*api.User, error)"
+	// ReturnsError is true when the method returns only an error (a
+	// content-less OpenAPI response, which ogen renders as `Foo(ctx) error`).
+	// The stub return statement is two-valued for `(T, error)` but must be
+	// single-valued here, or the generated code won't compile (issue #3).
+	ReturnsError bool
 }
 
 type TemplateData struct {
@@ -92,10 +97,11 @@ func run(args []string) error {
 
 			fullParams, names := parseParams(fset, fType.Params)
 			methods = append(methods, MethodData{
-				Name:       method.Names[0].Name,
-				FullParams: fullParams,
-				ParamNames: strings.Join(names, ", "),
-				Returns:    stringifyFields(fset, fType.Results),
+				Name:         method.Names[0].Name,
+				FullParams:   fullParams,
+				ParamNames:   strings.Join(names, ", "),
+				Returns:      stringifyFields(fset, fType.Results),
+				ReturnsError: fType.Results != nil && len(fType.Results.List) == 1,
 			})
 		}
 		return false

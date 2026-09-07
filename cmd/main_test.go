@@ -41,6 +41,11 @@ func Test_run(t *testing.T) {
 			targetDir: "test",
 		},
 		{
+			name:    "with content-less response",
+			openapi: `../../test-fixtures/openapi-spec-contentless.json`,
+			workDir: "t9",
+		},
+		{
 			name:    "with bearer security",
 			openapi: `../../test-fixtures/openapi-spec-bearer.json`,
 			workDir: "t3",
