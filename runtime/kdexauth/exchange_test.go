@@ -70,6 +70,50 @@ func TestExchange_NonJSONOrErrorStatusReturnsError(t *testing.T) {
 	})
 }
 
+func TestExchange_EmptyTokenEndpointOrResourceIsError(t *testing.T) {
+	t.Run("empty token endpoint", func(t *testing.T) {
+		tok, err := Exchange(context.Background(), Config{
+			TokenEndpoint: "",
+			SubjectToken:  "x",
+		}, "/v1/foo")
+
+		require.Error(t, err)
+		assert.Empty(t, tok)
+	})
+
+	t.Run("empty resource", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"should.not.be.reached"}`))
+		}))
+		defer srv.Close()
+
+		tok, err := Exchange(context.Background(), Config{
+			TokenEndpoint: srv.URL,
+			SubjectToken:  "x",
+		}, "")
+
+		require.Error(t, err)
+		assert.Empty(t, tok)
+	})
+}
+
+func TestExchange_EmptyAccessTokenOn200IsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"token_type":"Bearer"}`))
+	}))
+	defer srv.Close()
+
+	tok, err := Exchange(context.Background(), Config{
+		TokenEndpoint: srv.URL,
+		SubjectToken:  "the.inbound.fat",
+	}, "/v1/internal")
+
+	require.Error(t, err)
+	assert.Empty(t, tok)
+}
+
 func TestExchange_EmptySubjectTokenIsError(t *testing.T) {
 	called := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
