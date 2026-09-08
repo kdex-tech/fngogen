@@ -156,6 +156,74 @@ func Test_run(t *testing.T) {
 	}
 }
 
+// TestGenerate_BearerHandlerFlowsRawToken asserts the generated main.go
+// stashes the raw inbound bearer token on the context (RFC 8693 token
+// exchange support: a downstream handler/Exchange() call reads it back via
+// RequestTokenFromContext).
+func TestGenerate_BearerHandlerFlowsRawToken(t *testing.T) {
+	if _, err := os.Stat("../tmp"); err != nil {
+		if err := os.MkdirAll("../tmp", 0755); err != nil {
+			t.Fatalf("failed to create tmp dir: %v", err)
+		}
+	}
+
+	currentDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Could not get current directory: %v\n", err)
+	}
+
+	workDir := "t10"
+	if _, err := os.Stat("../tmp/" + workDir); err == nil {
+		if err := os.RemoveAll("../tmp/" + workDir); err != nil {
+			t.Fatalf("failed to remove work dir: %v", err)
+		}
+	}
+	if err := os.MkdirAll("../tmp/"+workDir, 0755); err != nil {
+		t.Fatalf("failed to create work dir: %v", err)
+	}
+	if err := os.Chdir("../tmp/" + workDir); err != nil {
+		t.Fatalf("Could not change directory: %v\n", err)
+	}
+	defer func() {
+		_ = os.Chdir(currentDir)
+	}()
+
+	goModInit := exec.Command("go", "mod", "init", "function")
+	if _, err := goModInit.Output(); !assert.NoError(t, err) {
+		return
+	}
+
+	openapi := "../../test-fixtures/openapi-spec-bearer.json"
+	generateFile := fmt.Sprintf(`package project
+
+//go:generate go run github.com/ogen-go/ogen/cmd/ogen@latest --target api --clean %s
+`, openapi)
+	if err := os.WriteFile("generate.go", []byte(generateFile), 0644); err != nil {
+		t.Fatalf("failed to write generate.go: %v", err)
+	}
+
+	goGenerate := exec.Command("go", "generate", "./...")
+	out, err := goGenerate.CombinedOutput()
+	if !assert.NoError(t, err, string(out)) {
+		return
+	}
+
+	if err := run([]string{"--spec", openapi}); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	generated, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	out2 := string(generated)
+
+	assert.Contains(t, out2, "RequestTokenContextKey ContextKey")
+	assert.Contains(t, out2, "func RequestTokenFromContext(ctx context.Context) (string, bool)")
+	// HandleBearer must put the raw token into the context it returns
+	assert.Contains(t, out2, "context.WithValue(ctx, RequestTokenContextKey, t.Token)")
+}
+
 func Test_generateSourceFile(t *testing.T) {
 	err := generateSourceFile("{{.Name}}", TemplateData{}, "/invalid/path/that/does/not/exist", "out.go", true)
 	if err == nil {

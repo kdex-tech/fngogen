@@ -239,8 +239,17 @@ func (p *pasetoPKs) refreshLoop() {
 type ContextKey string
 
 const (
-	UserContextKey ContextKey = "user"
+	UserContextKey         ContextKey = "user"
+	RequestTokenContextKey ContextKey = "request-token"
 )
+
+// RequestTokenFromContext returns the raw inbound bearer token carried on the
+// request, for handlers that need to exchange it for a token addressed to
+// another function (RFC 8693 token exchange via the host /-/token endpoint).
+func RequestTokenFromContext(ctx context.Context) (string, bool) {
+	tok, ok := ctx.Value(RequestTokenContextKey).(string)
+	return tok, ok
+}
 
 {{if .APIKeyCookieSecurity}}
 func (s *security) HandleApiKeyCookie(ctx context.Context, operationName api.OperationName, t api.ApiKeyCookie) (context.Context, error) {
@@ -315,6 +324,7 @@ func (s *security) HandleBearer(ctx context.Context, operationName api.Operation
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
+	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
 	return s.hasValidClaims(ctx, "entitlements", "bearer", t.Roles, token.Claims.(jwt.MapClaims))
 }
 {{end}}
@@ -326,6 +336,7 @@ func (s *security) HandleOAuth2(ctx context.Context, operationName api.Operation
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
+	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
 	return s.hasValidClaims(ctx, "scopes", "oauth2", t.Scopes, token.Claims.(jwt.MapClaims))
 }
 {{end}}
@@ -337,6 +348,7 @@ func (s *security) HandleOpenIdConnect(ctx context.Context, operationName api.Op
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
+	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
 	return s.hasValidClaims(ctx, "scopes", "oidc", t.Scopes, token.Claims.(jwt.MapClaims))
 }
 {{end}}
