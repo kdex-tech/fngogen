@@ -27,11 +27,30 @@ func TestExchange_PostsRFC8693FormAndReturnsAccessToken(t *testing.T) {
 	}, "/v1/internal")
 
 	require.NoError(t, err)
-	assert.Equal(t, "minted.jwt.for.b", tok)
+	assert.Equal(t, "minted.jwt.for.b", tok.AccessToken)
+	assert.Equal(t, 300, tok.ExpiresIn)
 	assert.Equal(t, "urn:ietf:params:oauth:grant-type:token-exchange", gotForm.Get("grant_type"))
 	assert.Equal(t, "the.inbound.fat", gotForm.Get("subject_token"))
 	assert.Equal(t, "urn:ietf:params:oauth:token-type:access_token", gotForm.Get("subject_token_type"))
 	assert.Equal(t, "/v1/internal", gotForm.Get("resource"))
+}
+
+func TestExchange_ExpiresInOmittedSucceedsWithZero(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// No expires_in field — the endpoint may omit it.
+		_, _ = w.Write([]byte(`{"access_token":"minted.jwt.for.b","token_type":"Bearer"}`))
+	}))
+	defer srv.Close()
+
+	tok, err := Exchange(context.Background(), Config{
+		TokenEndpoint: srv.URL,
+		SubjectToken:  "the.inbound.fat",
+	}, "/v1/internal")
+
+	require.NoError(t, err)
+	assert.Equal(t, "minted.jwt.for.b", tok.AccessToken)
+	assert.Equal(t, 0, tok.ExpiresIn, "ExpiresIn is 0 when the endpoint omits expires_in")
 }
 
 func TestExchange_NonJSONOrErrorStatusReturnsError(t *testing.T) {
