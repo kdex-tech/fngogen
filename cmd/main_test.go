@@ -224,6 +224,106 @@ func TestGenerate_BearerHandlerFlowsRawToken(t *testing.T) {
 	assert.Contains(t, out2, "context.WithValue(ctx, RequestTokenContextKey, t.Token)")
 }
 
+// generateFixture drives the full ogen + fngogen generation for one fixture
+// into ../tmp/<workDir>, leaving the process chdir'd there (restored on
+// cleanup) so a focused generation test can read the generated files under
+// cmd/. It mirrors Test_run's per-case setup without repeating it.
+func generateFixture(t *testing.T, workDir, fixture string) {
+	t.Helper()
+	if err := os.MkdirAll("../tmp", 0755); err != nil {
+		t.Fatalf("failed to create tmp dir: %v", err)
+	}
+	currentDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Could not get current directory: %v", err)
+	}
+	if _, err := os.Stat("../tmp/" + workDir); err == nil {
+		if err := os.RemoveAll("../tmp/" + workDir); err != nil {
+			t.Fatalf("failed to remove work dir: %v", err)
+		}
+	}
+	if err := os.MkdirAll("../tmp/"+workDir, 0755); err != nil {
+		t.Fatalf("failed to create work dir: %v", err)
+	}
+	if err := os.Chdir("../tmp/" + workDir); err != nil {
+		t.Fatalf("Could not change directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(currentDir) })
+
+	if _, err := exec.Command("go", "mod", "init", "function").Output(); err != nil {
+		t.Fatalf("go mod init: %v", err)
+	}
+	generateFile := fmt.Sprintf(`package project
+
+//go:generate go run github.com/ogen-go/ogen/cmd/ogen@latest --target api --clean %s
+`, fixture)
+	if err := os.WriteFile("generate.go", []byte(generateFile), 0644); err != nil {
+		t.Fatalf("failed to write generate.go: %v", err)
+	}
+	if out, err := exec.Command("go", "generate", "./...").CombinedOutput(); err != nil {
+		t.Fatalf("go generate: %v\n%s", err, out)
+	}
+	if err := run([]string{"--spec", fixture}); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if out, err := exec.Command("go", "mod", "tidy").CombinedOutput(); err != nil {
+		t.Fatalf("go mod tidy: %v\n%s", err, out)
+	}
+}
+
+// TestGenerate_SecurityExposesServerOptionsSeam asserts that when a spec
+// declares security, generated main.go threads a hand-authored ServerOptions()
+// into api.NewServer alongside NewSecurity(), and the never-overwritten
+// custom.go scaffold defines that hook (defaulting to nil). This is the seam a
+// consumer needs to combine the generated security handler with custom ogen
+// ServerOptions such as api.WithMiddleware. Before the fix the security branch
+// emitted only NewServer(NewHandler(), NewSecurity()), with nowhere to pass an
+// option. See kdex-tech/fngogen#7.
+func TestGenerate_SecurityExposesServerOptionsSeam(t *testing.T) {
+	generateFixture(t, "t11", "../../test-fixtures/openapi-spec-bearer.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(mainSrc), "NewSecurity(), ServerOptions()...)",
+		"generated main.go must thread ServerOptions() into NewServer alongside NewSecurity()")
+
+	customSrc, err := os.ReadFile("cmd/custom.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(customSrc), "func ServerOptions() []api.ServerOption",
+		"custom.go scaffold must define the hand-authored ServerOptions hook")
+
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+// TestGenerate_NoSecurityOmitsServerOptionsSeam guards issue #7's backward-
+// compatibility promise: a spec with no security scheme is untouched. main.go
+// stays the bare NewServer(NewHandler()) — whose multi-value-return spread is
+// the existing options seam — and custom.go gains no ServerOptions hook. See
+// kdex-tech/fngogen#7.
+func TestGenerate_NoSecurityOmitsServerOptionsSeam(t *testing.T) {
+	generateFixture(t, "t12", "../../test-fixtures/openapi-spec.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.NotContains(t, string(mainSrc), "ServerOptions",
+		"non-security main.go must not reference ServerOptions — the NewHandler() spread is its seam")
+
+	customSrc, err := os.ReadFile("cmd/custom.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.NotContains(t, string(customSrc), "ServerOptions",
+		"non-security custom.go scaffold must be unchanged")
+}
+
 func Test_generateSourceFile(t *testing.T) {
 	err := generateSourceFile("{{.Name}}", TemplateData{}, "/invalid/path/that/does/not/exist", "out.go", true)
 	if err == nil {

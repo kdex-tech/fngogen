@@ -18,6 +18,17 @@ func NewHandler() api.Handler {
 	return &defaultHandler{}
 	// return &customHandler{}
 }
+{{if .Security}}
+// ServerOptions returns extra ogen api.ServerOptions applied to the generated
+// server. It is the seam for combining the generated security handler with
+// hand-authored options such as api.WithMiddleware(...) -- e.g. an HMAC gate on
+// an internal operation whose raw body/headers the per-operation SecurityHandler
+// cannot see. main.go threads these into api.NewServer. This file is NOT
+// overwritten on regeneration, so options added here survive. Return nil for none.
+func ServerOptions() []api.ServerOption {
+	return nil
+}
+{{end}}
 
 // Uncommend the following to get you started
 /*
