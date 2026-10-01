@@ -6,9 +6,12 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Test_run(t *testing.T) {
@@ -228,7 +231,7 @@ func TestGenerate_BearerHandlerFlowsRawToken(t *testing.T) {
 // into ../tmp/<workDir>, leaving the process chdir'd there (restored on
 // cleanup) so a focused generation test can read the generated files under
 // cmd/. It mirrors Test_run's per-case setup without repeating it.
-func generateFixture(t *testing.T, workDir, fixture string) {
+func generateFixture(t *testing.T, workDir, fixture string, runArgs ...string) {
 	t.Helper()
 	if err := os.MkdirAll("../tmp", 0755); err != nil {
 		t.Fatalf("failed to create tmp dir: %v", err)
@@ -250,7 +253,15 @@ func generateFixture(t *testing.T, workDir, fixture string) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(currentDir) })
 
-	if _, err := exec.Command("go", "mod", "init", "function").Output(); err != nil {
+	// The module that owns the head: `function`, or the one -api-import
+	// implies, so the generated imports resolve and the result builds.
+	module := "function"
+	for i, a := range runArgs {
+		if a == "-api-import" && i+1 < len(runArgs) {
+			module = strings.TrimSuffix(runArgs[i+1], "/api")
+		}
+	}
+	if _, err := exec.Command("go", "mod", "init", module).Output(); err != nil {
 		t.Fatalf("go mod init: %v", err)
 	}
 	// Mirror entry-point.sh: the spec lands as openapi-spec.json, is prepared
@@ -275,7 +286,7 @@ func generateFixture(t *testing.T, workDir, fixture string) {
 	if out, err := exec.Command("go", "generate", "./...").CombinedOutput(); err != nil {
 		t.Fatalf("go generate: %v\n%s", err, out)
 	}
-	if err := run([]string{"--spec", "openapi-spec.json"}); err != nil {
+	if err := run(append([]string{"--spec", "openapi-spec.json"}, runArgs...)); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
 	if out, err := exec.Command("go", "mod", "tidy").CombinedOutput(); err != nil {
@@ -577,4 +588,136 @@ func TestGenerate_ValueTypeResultBuilds(t *testing.T) {
 	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
 		return
 	}
+}
+
+// generatedFiles are the cmd/ files fngogen writes for an SSE spec: every file
+// that imports the ogen package.
+var generatedFiles = []string{"cmd/main.go", "cmd/default.go", "cmd/custom.go", "cmd/custom_raw.go"}
+
+func readGenerated(t *testing.T) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, f := range generatedFiles {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		out[f] = string(b)
+	}
+	return out
+}
+
+// TestGenerate_APIImportDefault pins kdex-tech/fngogen#11's backward
+// compatibility: without -api-import every generated file imports
+// function/api, exactly as before.
+func TestGenerate_APIImportDefault(t *testing.T) {
+	generateFixture(t, "t18", "../../test-fixtures/openapi-spec-sse-bearer.json")
+	for f, src := range readGenerated(t) {
+		assert.Contains(t, src, `"function/api"`, f)
+	}
+}
+
+// TestGenerate_APIImportFlag is #11: with -api-import every generated file --
+// including custom_raw.go, which has its own template (#9) -- imports the
+// given path, and nothing else in the output changes.
+func TestGenerate_APIImportFlag(t *testing.T) {
+	start, err := os.Getwd()
+	require.NoError(t, err)
+	generateFixture(t, "t19", "../../test-fixtures/openapi-spec-sse-bearer.json")
+	want := readGenerated(t)
+	require.NoError(t, os.Chdir(start)) // generateFixture paths are relative to cmd/
+
+	const path = "example.com/svc/head/api"
+	generateFixture(t, "t20", "../../test-fixtures/openapi-spec-sse-bearer.json", "-api-import", path)
+	got := readGenerated(t)
+
+	for _, f := range generatedFiles {
+		assert.Contains(t, got[f], `"`+path+`"`, f)
+		assert.NotContains(t, got[f], `"function/api"`, f)
+		// gofmt sorts imports, so the import line may move: compare with it
+		// removed from both sides.
+		assert.Equal(t, withoutLineContaining(want[f], `"function/api"`), withoutLineContaining(got[f], `"`+path+`"`),
+			"%s: only the import path may differ", f)
+	}
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+func withoutLineContaining(src, needle string) string {
+	var kept []string
+	for _, line := range strings.Split(src, "\n") {
+		if !strings.Contains(line, needle) {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+func TestRun_RejectsInvalidAPIImport(t *testing.T) {
+	err := run([]string{"--spec", "openapi-spec.json", "-api-import", "example.com/svc/oas"})
+	assert.ErrorContains(t, err, "api-import")
+}
+
+// TestEntryPoint_APIImportInsideExistingModule drives entry-point.sh the way
+// #11's caller does: TARGET_DIR is a subdirectory of an existing module and
+// API_IMPORT_PATH names its ogen package. No nested module may be created, the
+// enclosing module must build from its root, and the generated head must be
+// able to import the module's internal/ packages -- the point of #11.
+func TestEntryPoint_APIImportInsideExistingModule(t *testing.T) {
+	root := t.TempDir()
+	bin := t.TempDir()
+
+	build := exec.Command("go", "build", "-o", filepath.Join(bin, "fngogen"), ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fngogen: %v\n%s", err, out)
+	}
+
+	inRoot := func(name string, args ...string) *exec.Cmd {
+		c := exec.Command(name, args...)
+		c.Dir = root
+		return c
+	}
+	if out, err := inRoot("go", "mod", "init", "example.com/svc").CombinedOutput(); err != nil {
+		t.Fatalf("go mod init: %v\n%s", err, out)
+	}
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "internal", "greet"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "internal", "greet", "greet.go"),
+		[]byte("package greet\n\nfunc Hello() string { return \"hello\" }\n"), 0644))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "head"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".env"), nil, 0644))
+
+	spec, err := os.ReadFile("../test-fixtures/openapi-spec-sse-bearer.json")
+	require.NoError(t, err)
+
+	ep := inRoot("bash", mustAbs(t, "../entry-point.sh"))
+	ep.Env = append(os.Environ(),
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"WORKDIR="+root,
+		"TARGET_DIR=head",
+		"API_IMPORT_PATH=example.com/svc/head/api",
+		"FUNCTION_API_SPEC="+string(spec),
+	)
+	if out, err := ep.CombinedOutput(); err != nil {
+		t.Fatalf("entry-point.sh: %v\n%s", err, out)
+	}
+
+	assert.NoFileExists(t, filepath.Join(root, "head", "go.mod"), "the head must not become a nested module")
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "head", "cmd", "uses_internal.go"), []byte(`package main
+
+import "example.com/svc/internal/greet"
+
+var _ = greet.Hello
+`), 0644))
+	if out, err := inRoot("go", "build", "./...").CombinedOutput(); err != nil {
+		t.Fatalf("go build ./... from the module root: %v\n%s", err, out)
+	}
+}
+
+func mustAbs(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	require.NoError(t, err)
+	return abs
 }

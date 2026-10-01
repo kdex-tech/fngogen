@@ -40,6 +40,9 @@ type MethodData struct {
 }
 
 type TemplateData struct {
+	// APIImport is the import path of the ogen-generated api package
+	// (-api-import; function/api by default). See kdex-tech/fngogen#11.
+	APIImport             string
 	APIKeyCookieSecurity  bool
 	APIKeyHeaderSecurity  bool
 	APIKeyQuerySecurity   bool
@@ -81,8 +84,12 @@ func run(args []string) error {
 	targetPtr := flags.String("target", "cmd", "the target directory to generate the code")
 	specPtr := flags.String("spec", "api/openapi.json", "the path to the openapi spec")
 	preparePtr := flags.Bool("prepare", false, "rewrite the spec for ogen before generation, then exit (see prepareSpec)")
+	apiImportPtr := flags.String("api-import", defaultAPIImport, "import path of the ogen-generated api package, for a head inside an existing module")
 
 	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if err := validateAPIImport(*apiImportPtr); err != nil {
 		return err
 	}
 
@@ -154,6 +161,7 @@ func run(args []string) error {
 	}
 
 	templateData := TemplateData{
+		APIImport:             *apiImportPtr,
 		APIKeyCookieSecurity:  apiKeyCookieSecurity,
 		APIKeyHeaderSecurity:  apiKeyHeaderSecurity,
 		APIKeyQuerySecurity:   apiKeyQuerySecurity,
