@@ -71,6 +71,9 @@ var customTemplate string
 //go:embed templates/custom_raw.go.tmpl
 var customRawTemplate string
 
+//go:embed templates/custom_server.go.tmpl
+var customServerTemplate string
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -187,6 +190,12 @@ func run(args []string) error {
 		return err
 	}
 	if err := generateSourceFile(customTemplate, templateData, *targetPtr, "custom.go", false); err != nil {
+		return err
+	}
+	// ServerConfig, like NewRawHandler below, lives in its own
+	// never-overwritten file rather than in custom.go, so functions
+	// scaffolded before it existed still get it. See kdex-tech/fngogen#12.
+	if err := generateSourceFile(customServerTemplate, templateData, *targetPtr, "custom_server.go", false); err != nil {
 		return err
 	}
 	// NewRawHandler lives in its own never-overwritten file rather than in

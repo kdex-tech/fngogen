@@ -1,0 +1,21 @@
+package main
+
+import "net/http"
+
+/*
+ServerConfig customizes the function's *http.Server before it starts
+listening: timeouts, ErrorLog, RegisterOnShutdown, TLS, and so on.
+
+The generated main.go has already set:
+  - Addr from PORT;
+  - ReadHeaderTimeout: 10s;
+  - IdleTimeout: 120s;
+  - no WriteTimeout, because it would cap every text/event-stream response.
+
+Change any of them here. On SIGTERM, main.go calls Shutdown with a grace of
+SHUTDOWN_GRACE_SECONDS (default 20s); see ShuttingDown() in main.go.
+
+NOTE: This file will NOT be overwritten on regeneration.
+*/
+func ServerConfig(srv *http.Server) {
+}

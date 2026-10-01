@@ -14,7 +14,8 @@ To stream correctly:
   - set Content-Type to text/event-stream, then WriteHeader, before the first event;
   - flush each event with http.NewResponseController(w).Flush(); a plain
     w.(http.Flusher) type assertion fails, because w is wrapped;
-  - stop when ctx is done: the client disconnected, so return nil.
+  - stop when ctx is done (the client disconnected) or when ShuttingDown() is
+    closed (the function is draining; the client reconnects elsewhere).
 
 For example:
 
@@ -25,6 +26,8 @@ For example:
 		for {
 			select {
 			case <-ctx.Done():
+				return nil
+			case <-ShuttingDown():
 				return nil
 			case update := <-h.updates:
 				if _, err := fmt.Fprintf(w, "data: %s\n\n", update); err != nil {

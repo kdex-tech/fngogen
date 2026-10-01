@@ -2,17 +2,21 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
 
 	"{{.APIImport}}"
 
 	{{if .Security}}
-	"context"
 	"strings"
-	"time"
 	"github.com/MicahParks/keyfunc/v2"
 	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
 	"aidanwoods.dev/go-paseto"
@@ -36,9 +40,73 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	if err := http.ListenAndServe(fmt.Sprintf(":%s", port), srv); err != nil {
+	grace := shutdownGrace()
+
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%s", port),
+		Handler:           srv,
+		ReadHeaderTimeout: 10 * time.Second,
+		// Above Go's default client IdleConnTimeout (90s), so a client closes
+		// an idle keep-alive connection before the server does.
+		IdleTimeout: 120 * time.Second,
+		// No WriteTimeout: it would cap every text/event-stream response.
+		// Set one in ServerConfig if this function needs it.
+	}
+	ServerConfig(server)
+
+	signals, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
+	served := make(chan error, 1)
+	go func() { served <- server.ListenAndServe() }()
+
+	select {
+	case err := <-served:
+		log.Fatal(err)
+	case <-signals.Done():
+	}
+	stop()
+
+	log.Printf("shutting down: draining in-flight requests for up to %s", grace)
+	close(shuttingDown)
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
+		log.Fatalf("shutdown grace of %s expired; closed the connections still open: %v", grace, err)
+	}
+	if err := <-served; !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+var shuttingDown = make(chan struct{})
+
+// ShuttingDown is closed when the function receives SIGTERM or SIGINT and
+// starts draining. A long-lived handler -- an event stream -- should select
+// on it and return, so the client reconnects to another instance; ordinary
+// requests just finish. Connections still open when the grace
+// (SHUTDOWN_GRACE_SECONDS) expires are closed and the process exits 1.
+// See kdex-tech/fngogen#12.
+func ShuttingDown() <-chan struct{} {
+	return shuttingDown
+}
+
+// shutdownGrace is how long SIGTERM waits for in-flight requests:
+// SHUTDOWN_GRACE_SECONDS, default 20s -- under Kubernetes' default 30s
+// terminationGracePeriodSeconds, so the process exits before SIGKILL.
+func shutdownGrace() time.Duration {
+	const defaultGrace = 20 * time.Second
+	v := os.Getenv("SHUTDOWN_GRACE_SECONDS")
+	if v == "" {
+		return defaultGrace
+	}
+	seconds, err := strconv.Atoi(v)
+	if err != nil || seconds < 0 {
+		log.Printf("ignoring invalid SHUTDOWN_GRACE_SECONDS=%q; using %s", v, defaultGrace)
+		return defaultGrace
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 {{if .Security}}
