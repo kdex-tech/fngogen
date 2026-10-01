@@ -253,17 +253,29 @@ func generateFixture(t *testing.T, workDir, fixture string) {
 	if _, err := exec.Command("go", "mod", "init", "function").Output(); err != nil {
 		t.Fatalf("go mod init: %v", err)
 	}
-	generateFile := fmt.Sprintf(`package project
+	// Mirror entry-point.sh: the spec lands as openapi-spec.json, is prepared
+	// for ogen, then ogen and fngogen run over it.
+	spec, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if err := os.WriteFile("openapi-spec.json", spec, 0644); err != nil {
+		t.Fatalf("write openapi-spec.json: %v", err)
+	}
+	if err := run([]string{"--prepare", "--spec", "openapi-spec.json"}); err != nil {
+		t.Fatalf("run(--prepare) error = %v", err)
+	}
+	generateFile := `package project
 
-//go:generate go run github.com/ogen-go/ogen/cmd/ogen@latest --target api --clean %s
-`, fixture)
+//go:generate go run github.com/ogen-go/ogen/cmd/ogen@latest --target api --clean openapi-spec.json
+`
 	if err := os.WriteFile("generate.go", []byte(generateFile), 0644); err != nil {
 		t.Fatalf("failed to write generate.go: %v", err)
 	}
 	if out, err := exec.Command("go", "generate", "./...").CombinedOutput(); err != nil {
 		t.Fatalf("go generate: %v\n%s", err, out)
 	}
-	if err := run([]string{"--spec", fixture}); err != nil {
+	if err := run([]string{"--spec", "openapi-spec.json"}); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
 	if out, err := exec.Command("go", "mod", "tidy").CombinedOutput(); err != nil {
@@ -388,4 +400,169 @@ func Test_parseParamsAndStringifyFields(t *testing.T) {
 	if str != "" {
 		t.Error("Expected empty result from nil field list")
 	}
+}
+
+// TestGenerate_SSEBuilds is kdex-tech/fngogen#9: a spec declaring
+// text/event-stream responses -- typed and untyped -- must generate a function
+// that builds. The prepared spec routes those operations to ogen's
+// RawHandler, which main.go must pass to api.NewServer, and whose constructor
+// lives in its own never-overwritten custom_raw.go.
+func TestGenerate_SSEBuilds(t *testing.T) {
+	generateFixture(t, "t13", "../../test-fixtures/openapi-spec-sse.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(mainSrc), "api.NewServer(NewHandler(), NewRawHandler())")
+
+	defaultSrc, err := os.ReadFile("cmd/default.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(defaultSrc), "var _ api.RawHandler = (*defaultRawHandler)(nil)")
+
+	customRawSrc, err := os.ReadFile("cmd/custom_raw.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(customRawSrc), "func NewRawHandler() api.RawHandler")
+	// Go source is rendered verbatim: the example's channel receives must not
+	// be HTML-escaped into "&lt;-".
+	assert.Contains(t, string(customRawSrc), "case <-ctx.Done():")
+
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+// TestGenerate_SSEWithSecurityBuilds covers the raw handler alongside the
+// generated security handler and the ServerOptions seam (#7).
+func TestGenerate_SSEWithSecurityBuilds(t *testing.T) {
+	generateFixture(t, "t14", "../../test-fixtures/openapi-spec-sse-bearer.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(mainSrc), "api.NewServer(NewHandler(), NewRawHandler(), NewSecurity(), ServerOptions()...)")
+
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+// TestGenerate_SSEStreamsLiveAndIsGated drives the generated SSE function over
+// HTTP: an operation implemented the way custom_raw.go's example shows must be
+// security-gated and deliver each event as it is written, not at stream end.
+// ogen runs at @latest, so this also guards against an ogen release that stops
+// running security before raw handlers or breaks flushing through its
+// response-writer wrapper. See kdex-tech/fngogen#9.
+func TestGenerate_SSEStreamsLiveAndIsGated(t *testing.T) {
+	generateFixture(t, "t15", "../../test-fixtures/openapi-spec-sse-bearer.json")
+
+	probe := `package main
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"function/api"
+)
+
+type streamingHandler struct{ *defaultRawHandler }
+
+func (streamingHandler) GenV1EventsGet(ctx context.Context, w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+	for i := 0; i < 3; i++ {
+		if _, err := fmt.Fprintf(w, "data: %d\n\n", i); err != nil {
+			return err
+		}
+		if err := rc.Flush(); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
+type stubSecurity struct{}
+
+func (stubSecurity) HandleBearer(ctx context.Context, _ api.OperationName, t api.Bearer) (context.Context, error) {
+	if t.Token != "good" {
+		return nil, errors.New("bad token")
+	}
+	return ctx, nil
+}
+
+func TestSSE(t *testing.T) {
+	srv, err := api.NewServer(NewHandler(), streamingHandler{&defaultRawHandler{}}, stubSecurity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token: got %d, want 401", resp.StatusCode)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/events", nil)
+	req.Header.Set("Authorization", "Bearer good")
+	start := time.Now()
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("content type %q", ct)
+	}
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		if sc.Text() == "data: 0" {
+			if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+				t.Fatalf("first event arrived after %v: the stream is buffered", elapsed)
+			}
+			return
+		}
+	}
+	t.Fatal("no event received")
+}
+`
+	if err := os.WriteFile("cmd/sse_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+		return
+	}
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestSSE", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
+}
+
+// TestGenerate_NoSSEOmitsRawHandler guards #9's backward compatibility: a spec
+// with no event-stream response generates exactly as before.
+func TestGenerate_NoSSEOmitsRawHandler(t *testing.T) {
+	generateFixture(t, "t16", "../../test-fixtures/openapi-spec.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.NotContains(t, string(mainSrc), "RawHandler")
+	assert.NoFileExists(t, "cmd/custom_raw.go")
 }

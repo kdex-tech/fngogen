@@ -11,10 +11,10 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
-	"html/template"
 	"io"
 	"os"
 	"strings"
+	"text/template"
 
 	"github.com/Masterminds/sprig/v3"
 )
@@ -42,7 +42,13 @@ type TemplateData struct {
 	Methods               []MethodData
 	OAuth2Security        bool
 	OpenIdConnectSecurity bool
-	Security              bool
+	// Raw is true when ogen generated a RawHandler: operations whose
+	// response is marked x-ogen-raw-response (every text/event-stream
+	// response, see prepareSpec) are served by it with the
+	// http.ResponseWriter. See kdex-tech/fngogen#9.
+	Raw        bool
+	RawMethods []MethodData
+	Security   bool
 }
 
 //go:embed templates/main.go.tmpl
@@ -53,6 +59,9 @@ var defaultTemplate string
 
 //go:embed templates/custom.go.tmpl
 var customTemplate string
+
+//go:embed templates/custom_raw.go.tmpl
+var customRawTemplate string
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -66,9 +75,14 @@ func run(args []string) error {
 	flags.SetOutput(io.Discard)
 	targetPtr := flags.String("target", "cmd", "the target directory to generate the code")
 	specPtr := flags.String("spec", "api/openapi.json", "the path to the openapi spec")
+	preparePtr := flags.Bool("prepare", false, "rewrite the spec for ogen before generation, then exit (see prepareSpec)")
 
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+
+	if *preparePtr {
+		return prepareSpecFile(*specPtr)
 	}
 
 	fset := token.NewFileSet()
@@ -77,35 +91,8 @@ func run(args []string) error {
 		return err
 	}
 
-	var methods []MethodData
-
-	ast.Inspect(node, func(n ast.Node) bool {
-		ts, ok := n.(*ast.TypeSpec)
-		if !ok || ts.Name.Name != "Handler" {
-			return true
-		}
-		inter, ok := ts.Type.(*ast.InterfaceType)
-		if !ok {
-			return true
-		}
-
-		for _, method := range inter.Methods.List {
-			fType, ok := method.Type.(*ast.FuncType)
-			if !ok {
-				continue
-			}
-
-			fullParams, names := parseParams(fset, fType.Params)
-			methods = append(methods, MethodData{
-				Name:         method.Names[0].Name,
-				FullParams:   fullParams,
-				ParamNames:   strings.Join(names, ", "),
-				Returns:      stringifyFields(fset, fType.Results),
-				ReturnsError: fType.Results != nil && len(fType.Results.List) == 1,
-			})
-		}
-		return false
-	})
+	methods := interfaceMethods(fset, node, "Handler")
+	rawMethods := interfaceMethods(fset, node, "RawHandler")
 
 	// read the openapi spec to check for all the security schemes implemented
 	if _, err := os.Stat(*specPtr); err != nil {
@@ -169,6 +156,8 @@ func run(args []string) error {
 		Methods:               methods,
 		OAuth2Security:        oauth2Security,
 		OpenIdConnectSecurity: openIdConnectSecurity,
+		Raw:                   len(rawMethods) > 0,
+		RawMethods:            rawMethods,
 		Security:              security,
 	}
 
@@ -187,8 +176,51 @@ func run(args []string) error {
 	if err := generateSourceFile(customTemplate, templateData, *targetPtr, "custom.go", false); err != nil {
 		return err
 	}
+	// NewRawHandler lives in its own never-overwritten file rather than in
+	// custom.go, so a function that gains its first event-stream operation
+	// after custom.go was scaffolded still gets the constructor.
+	if templateData.Raw {
+		if err := generateSourceFile(customRawTemplate, templateData, *targetPtr, "custom_raw.go", false); err != nil {
+			return err
+		}
+	}
 
 	return nil
+}
+
+// interfaceMethods returns the methods of the named interface type in the
+// ogen-generated server file (Handler, or RawHandler), or nil when the file
+// declares no such interface.
+func interfaceMethods(fset *token.FileSet, node *ast.File, name string) []MethodData {
+	var methods []MethodData
+	ast.Inspect(node, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != name {
+			return true
+		}
+		inter, ok := ts.Type.(*ast.InterfaceType)
+		if !ok {
+			return true
+		}
+
+		for _, method := range inter.Methods.List {
+			fType, ok := method.Type.(*ast.FuncType)
+			if !ok {
+				continue
+			}
+
+			fullParams, names := parseParams(fset, fType.Params)
+			methods = append(methods, MethodData{
+				Name:         method.Names[0].Name,
+				FullParams:   fullParams,
+				ParamNames:   strings.Join(names, ", "),
+				Returns:      stringifyFields(fset, fType.Results),
+				ReturnsError: fType.Results != nil && len(fType.Results.List) == 1,
+			})
+		}
+		return false
+	})
+	return methods
 }
 
 func generateSourceFile(templateString string, templateData TemplateData, outputDir string, outputFileName string, overwrite bool) error {

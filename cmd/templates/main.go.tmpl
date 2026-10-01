@@ -28,7 +28,7 @@ import (
 )
 
 func main() {
-	srv, err := api.NewServer(NewHandler(){{if .Security}}, NewSecurity(), ServerOptions()...{{end}})
+	srv, err := api.NewServer(NewHandler(){{if .Raw}}, NewRawHandler(){{end}}{{if .Security}}, NewSecurity(), ServerOptions()...{{end}})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -131,11 +131,6 @@ func NewSecurity() *security {
 // JWKS or the last error after maxAttempts. This is the startup-only
 // retry; once jwks is built, keyfunc handles periodic refresh internally
 // per RefreshInterval below.
-//
-// Note: this function deliberately avoids less-than / greater-than
-// comparison operators because fngogen renders this template with
-// html/template, which would HTML-escape them and break the generated
-// Go source. Use equality/inequality only.
 func fetchJWKSWithBackoff(jwksURL string) (*keyfunc.JWKS, error) {
 	const maxAttempts = 6
 	backoff := time.Second

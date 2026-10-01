@@ -1,0 +1,55 @@
+package main
+
+import "function/api"
+
+/*
+IMPLEMENTATION INSTRUCTIONS:
+
+Make customRawHandler implement the api.RawHandler interface. Its operations
+are the ones whose response is text/event-stream (server-sent events): each
+receives the http.ResponseWriter and writes the stream itself. Security has
+already run, so the context carries the same claims as in api.Handler.
+
+To stream correctly:
+  - set Content-Type to text/event-stream, then WriteHeader, before the first event;
+  - flush each event with http.NewResponseController(w).Flush(); a plain
+    w.(http.Flusher) type assertion fails, because w is wrapped;
+  - stop when ctx is done: the client disconnected, so return nil.
+
+For example:
+
+	func (h *customRawHandler) StreamEvents(ctx context.Context, w http.ResponseWriter) error {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		rc := http.NewResponseController(w)
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case update := <-h.updates:
+				if _, err := fmt.Fprintf(w, "data: %s\n\n", update); err != nil {
+					return err
+				}
+				if err := rc.Flush(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+NOTE: This file will NOT be overwritten on regeneration.
+*/
+
+func NewRawHandler() api.RawHandler {
+	return &defaultRawHandler{}
+	// return &customRawHandler{}
+}
+
+// Uncomment the following to get you started
+/*
+type customRawHandler struct {}
+
+var _ api.RawHandler = (*customRawHandler)(nil)
+
+// implement raw handler methods
+*/

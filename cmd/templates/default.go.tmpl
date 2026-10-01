@@ -6,6 +6,9 @@ import (
 	"context"
 	"fmt"
 	"function/api"
+	{{if .Raw}}
+	"net/http"
+	{{end}}
 
 	{{if .Security}}
 	"github.com/golang-jwt/jwt/v5"
@@ -16,18 +19,33 @@ type defaultHandler struct {}
 
 var _ api.Handler = (*defaultHandler)(nil)
 
-{{range .Methods}}
-func (dh *defaultHandler) {{.Name}}({{.FullParams}}) {{.Returns}} {
-	{{- if $.Security}}
+{{define "stub"}}
+	{{- if .Security}}
 	if userClaims, ok := ctx.Value(UserContextKey).(jwt.MapClaims); ok {
 		userId, _ := userClaims.GetSubject()
-		_, _ = fmt.Println("Executing function:", "{{.Name}}", ", user id:", userId, ", all user claims:", userClaims)
+		_, _ = fmt.Println("Executing function:", "{{.Method.Name}}", ", user id:", userId, ", all user claims:", userClaims)
 	}
 	{{end}}
-	{{- if .ReturnsError}}
+	{{- if .Method.ReturnsError}}
 	return fmt.Errorf("not implemented")
 	{{- else}}
 	return nil, fmt.Errorf("not implemented")
 	{{- end}}
+{{- end}}
+
+{{range .Methods}}
+func (dh *defaultHandler) {{.Name}}({{.FullParams}}) {{.Returns}} {
+	{{- template "stub" (dict "Security" $.Security "Method" .)}}
 }
+{{end}}
+{{if .Raw}}
+type defaultRawHandler struct {}
+
+var _ api.RawHandler = (*defaultRawHandler)(nil)
+
+{{range .RawMethods}}
+func (dh *defaultRawHandler) {{.Name}}({{.FullParams}}) {{.Returns}} {
+	{{- template "stub" (dict "Security" $.Security "Method" .)}}
+}
+{{end}}
 {{end}}

@@ -11,6 +11,9 @@ cd "${TARGET_DIR}"
 
 echo "${FUNCTION_API_SPEC}" > openapi-spec.json
 
+# Route text/event-stream responses to ogen's RawHandler (kdex-tech/fngogen#9).
+fngogen --prepare --spec openapi-spec.json
+
 cat <<EOF > generate.go
 package project
 
