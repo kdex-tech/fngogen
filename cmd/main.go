@@ -32,6 +32,11 @@ type MethodData struct {
 	// The stub return statement is two-valued for `(T, error)` but must be
 	// single-valued here, or the generated code won't compile (issue #3).
 	ReturnsError bool
+	// ResultType is T for a `(T, error)` method. The stub returns T's zero
+	// value: ogen renders some results as struct values (e.g. a single
+	// binary response), for which `return nil, ...` does not compile
+	// (issue #10).
+	ResultType string
 }
 
 type TemplateData struct {
@@ -210,13 +215,18 @@ func interfaceMethods(fset *token.FileSet, node *ast.File, name string) []Method
 			}
 
 			fullParams, names := parseParams(fset, fType.Params)
-			methods = append(methods, MethodData{
+			results := fieldTypes(fset, fType.Results)
+			md := MethodData{
 				Name:         method.Names[0].Name,
 				FullParams:   fullParams,
 				ParamNames:   strings.Join(names, ", "),
 				Returns:      stringifyFields(fset, fType.Results),
-				ReturnsError: fType.Results != nil && len(fType.Results.List) == 1,
-			})
+				ReturnsError: len(results) == 1,
+			}
+			if len(results) == 2 {
+				md.ResultType = results[0]
+			}
+			methods = append(methods, md)
 		}
 		return false
 	})
@@ -304,8 +314,17 @@ func parseParams(fset *token.FileSet, list *ast.FieldList) (string, []string) {
 }
 
 func stringifyFields(fset *token.FileSet, list *ast.FieldList) string {
+	parts := fieldTypes(fset, list)
+	if len(parts) > 1 {
+		return "(" + strings.Join(parts, ", ") + ")"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// fieldTypes renders each field's type, prefixed into the api package.
+func fieldTypes(fset *token.FileSet, list *ast.FieldList) []string {
 	if list == nil {
-		return ""
+		return nil
 	}
 	var parts []string
 	for _, f := range list.List {
@@ -316,8 +335,5 @@ func stringifyFields(fset *token.FileSet, list *ast.FieldList) string {
 		bString := strings.ReplaceAll(strings.ReplaceAll(b.String(), "\n", ""), "\t", "")
 		parts = append(parts, bString)
 	}
-	if len(parts) > 1 {
-		return "(" + strings.Join(parts, ", ") + ")"
-	}
-	return strings.Join(parts, ", ")
+	return parts
 }

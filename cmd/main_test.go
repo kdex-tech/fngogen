@@ -566,3 +566,15 @@ func TestGenerate_NoSSEOmitsRawHandler(t *testing.T) {
 	assert.NotContains(t, string(mainSrc), "RawHandler")
 	assert.NoFileExists(t, "cmd/custom_raw.go")
 }
+
+// TestGenerate_ValueTypeResultBuilds is kdex-tech/fngogen#10: ogen renders a
+// single binary response as a struct value (`(api.XxxOK, error)`), for which
+// the default stub's `return nil, ...` does not compile. The stub must return
+// the zero value of whatever the result type is.
+func TestGenerate_ValueTypeResultBuilds(t *testing.T) {
+	generateFixture(t, "t17", "../../test-fixtures/openapi-spec-binary.json")
+
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}

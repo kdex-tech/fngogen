@@ -29,7 +29,8 @@ var _ api.Handler = (*defaultHandler)(nil)
 	{{- if .Method.ReturnsError}}
 	return fmt.Errorf("not implemented")
 	{{- else}}
-	return nil, fmt.Errorf("not implemented")
+	var zero {{.Method.ResultType}}
+	return zero, fmt.Errorf("not implemented")
 	{{- end}}
 {{- end}}
 
