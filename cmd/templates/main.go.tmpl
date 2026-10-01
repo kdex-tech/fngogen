@@ -380,9 +380,23 @@ func (s *security) handleApiKey(ctx context.Context, operationName api.Operation
 }
 {{end}}
 
+{{if or .BearerSecurity .OAuth2Security .OpenIdConnectSecurity}}
+// parseJWT verifies a JWT against the host's JWKS, audience and issuer, and
+// requires `exp`: golang-jwt treats it as optional, and reads `exp: 0` as
+// absent, so without this a token carrying either shape would never expire.
+// See kdex-tech/fngogen#13.
+func (s *security) parseJWT(tokenString string) (*jwt.Token, error) {
+	return jwt.Parse(tokenString, s.jwks.Keyfunc,
+		jwt.WithAudience(s.audience),
+		jwt.WithIssuer(s.issuer),
+		jwt.WithExpirationRequired(),
+	)
+}
+{{end}}
+
 {{if .BearerSecurity}}
 func (s *security) HandleBearer(ctx context.Context, operationName api.OperationName, t api.Bearer) (context.Context, error) {
-	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc, jwt.WithAudience(s.audience), jwt.WithIssuer(s.issuer))
+	token, err := s.parseJWT(t.Token)
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
@@ -394,7 +408,7 @@ func (s *security) HandleBearer(ctx context.Context, operationName api.Operation
 
 {{if .OAuth2Security}}	
 func (s *security) HandleOAuth2(ctx context.Context, operationName api.OperationName, t api.OAuth2) (context.Context, error) {
-	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc, jwt.WithAudience(s.audience), jwt.WithIssuer(s.issuer))
+	token, err := s.parseJWT(t.Token)
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
@@ -406,7 +420,7 @@ func (s *security) HandleOAuth2(ctx context.Context, operationName api.Operation
 
 {{if .OpenIdConnectSecurity}}
 func (s *security) HandleOpenIdConnect(ctx context.Context, operationName api.OperationName, t api.OpenIdConnect) (context.Context, error) {
-	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc, jwt.WithAudience(s.audience), jwt.WithIssuer(s.issuer))
+	token, err := s.parseJWT(t.Token)
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}

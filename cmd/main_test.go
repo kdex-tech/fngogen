@@ -721,3 +721,89 @@ func mustAbs(t *testing.T, p string) string {
 	require.NoError(t, err)
 	return abs
 }
+
+// TestGenerate_BearerRequiresExp is kdex-tech/fngogen#13: the generated JWT
+// security handlers must reject a token that never expires. golang-jwt v5
+// treats `exp` as optional unless required, and reads `exp: 0` as absent. The
+// probe drives the generated NewSecurity()/HandleBearer against a test JWKS;
+// each token is otherwise valid, so a rejection is attributable to `exp`.
+func TestGenerate_BearerRequiresExp(t *testing.T) {
+	generateFixture(t, "t24", "../../test-fixtures/openapi-spec-bearer.json")
+
+	probe := `package main
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+
+	"function/api"
+)
+
+func TestBearerExp(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b64 := base64.RawURLEncoding.EncodeToString
+	jwks := fmt.Sprintf(` + "`" + `{"keys":[{"kty":"EC","crv":"P-256","kid":"k","alg":"ES256","use":"sig","x":%q,"y":%q}]}` + "`" + `,
+		b64(priv.X.FillBytes(make([]byte, 32))), b64(priv.Y.FillBytes(make([]byte, 32))))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(jwks))
+	}))
+	defer srv.Close()
+	t.Setenv("AUDIENCE", "https://fn.example.test")
+	t.Setenv("ISSUER", "https://host.example.test")
+	t.Setenv("JWKS_URL", srv.URL)
+	s := NewSecurity()
+
+	mint := func(exp any, setExp bool) string {
+		claims := jwt.MapClaims{
+			"sub": "alice", "aud": "https://fn.example.test", "iss": "https://host.example.test",
+			"entitlements": []string{}, "iat": time.Now().Unix(),
+		}
+		if setExp {
+			claims["exp"] = exp
+		}
+		tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+		tok.Header["kid"] = "k"
+		signed, err := tok.SignedString(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return signed
+	}
+
+	for _, tc := range []struct {
+		name     string
+		token    string
+		accepted bool
+	}{
+		{"valid exp", mint(time.Now().Add(time.Hour).Unix(), true), true},
+		{"no exp", mint(nil, false), false},
+		{"exp 0", mint(0, true), false},
+		{"expired", mint(time.Now().Add(-time.Hour).Unix(), true), false},
+	} {
+		_, err := s.HandleBearer(context.Background(), "op", api.Bearer{Token: tc.token})
+		if got := err == nil; got != tc.accepted {
+			t.Errorf("%s: accepted=%v, want %v (err: %v)", tc.name, got, tc.accepted, err)
+		}
+	}
+}
+`
+	if err := os.WriteFile("cmd/bearer_exp_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+		return
+	}
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestBearerExp", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
+}
