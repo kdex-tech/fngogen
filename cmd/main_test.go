@@ -730,17 +730,11 @@ func mustAbs(t *testing.T, p string) string {
 func TestGenerate_BearerRequiresExp(t *testing.T) {
 	generateFixture(t, "t24", "../../test-fixtures/openapi-spec-bearer.json")
 
+	writeJWTProbeHelpers(t)
 	probe := `package main
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"encoding/base64"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -750,38 +744,15 @@ import (
 )
 
 func TestBearerExp(t *testing.T) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b64 := base64.RawURLEncoding.EncodeToString
-	jwks := fmt.Sprintf(` + "`" + `{"keys":[{"kty":"EC","crv":"P-256","kid":"k","alg":"ES256","use":"sig","x":%q,"y":%q}]}` + "`" + `,
-		b64(priv.X.FillBytes(make([]byte, 32))), b64(priv.Y.FillBytes(make([]byte, 32))))
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(jwks))
-	}))
-	defer srv.Close()
-	t.Setenv("AUDIENCE", "https://fn.example.test")
-	t.Setenv("ISSUER", "https://host.example.test")
-	t.Setenv("JWKS_URL", srv.URL)
+	priv := startTestJWKS(t)
 	s := NewSecurity()
 
 	mint := func(exp any, setExp bool) string {
-		claims := jwt.MapClaims{
-			"sub": "alice", "aud": "https://fn.example.test", "iss": "https://host.example.test",
-			"entitlements": []string{}, "iat": time.Now().Unix(),
-		}
+		claims := jwt.MapClaims{"entitlements": []string{}}
 		if setExp {
 			claims["exp"] = exp
 		}
-		tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-		tok.Header["kid"] = "k"
-		signed, err := tok.SignedString(priv)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return signed
+		return mintTestJWT(t, priv, claims)
 	}
 
 	for _, tc := range []struct {
@@ -806,4 +777,170 @@ func TestBearerExp(t *testing.T) {
 	}
 	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestBearerExp", "-count=1").CombinedOutput()
 	assert.NoError(t, err, string(out))
+}
+
+// TestGenerate_BearerBindsRequirementPlaceholders is kdex-tech/fngogen#15: the
+// generated security must bind each {placeholder} in an operation's
+// requirements from the request -- the op's x-entitlement-binding chain, else
+// the path parameter of the same name -- before verifying, exactly as the host
+// gate does. Unbound, `roles:{key}:update` is a literal that only a held
+// wildcard satisfies, so a per-instance grant the host admitted was refused
+// here. The probe runs the generated main() against a test JWKS and drives it
+// over HTTP, so the wiring in main.go is under test, not just the handler. A
+// denial is ogen's 401; an admitted request reaches the stub and fails 500.
+func TestGenerate_BearerBindsRequirementPlaceholders(t *testing.T) {
+	generateFixture(t, "t25", "../../test-fixtures/openapi-spec-bearer-placeholders.json")
+
+	writeJWTProbeHelpers(t)
+	probe := `package main
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestBearerPlaceholders(t *testing.T) {
+	priv := startTestJWKS(t)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	t.Setenv("PORT", fmt.Sprint(port))
+	go main()
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
+			_ = c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("function did not start listening")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	mint := func(ents ...string) string {
+		return mintTestJWT(t, priv, jwt.MapClaims{
+			"entitlements": ents, "exp": time.Now().Add(time.Hour).Unix(),
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		method   string
+		path     string
+		header   string
+		ents     []string
+		admitted bool
+	}{
+		{"per-instance grant", "PUT", "/v1/roles/analysts", "", []string{"roles:analysts:update"}, true},
+		{"other instance", "PUT", "/v1/roles/analysts", "", []string{"roles:engineers:update"}, false},
+		{"wildcard grant", "PUT", "/v1/roles/analysts", "", []string{"roles:*:update"}, true},
+		{"literal placeholder grant", "PUT", "/v1/roles/analysts", "", []string{"roles:{key}:update"}, false},
+		{"percent-encoded segment", "PUT", "/v1/roles/a%20b", "", []string{"roles:a b:update"}, true},
+		{"two placeholders", "PUT", "/v1/roles/analysts/members/u1", "", []string{"roles:analysts:update", "users:u1:update_roles"}, true},
+		{"two placeholders, wrong second", "PUT", "/v1/roles/analysts/members/u1", "", []string{"roles:analysts:update", "users:u2:update_roles"}, false},
+		{"declared header source", "POST", "/v1/stores", "vs1", []string{"stores:vs1:write"}, true},
+		{"declared query fallback", "POST", "/v1/stores?store=vs1", "", []string{"stores:vs1:write"}, true},
+		{"header outranks query", "POST", "/v1/stores?store=vs1", "vs2", []string{"stores:vs1:write"}, false},
+		{"unbound fails closed", "POST", "/v1/stores", "", []string{"stores:*:write"}, false},
+		{"wildcard value refused", "POST", "/v1/stores", "*", []string{"stores:*:write"}, false},
+	} {
+		req, err := http.NewRequest(tc.method, base+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+mint(tc.ents...))
+		if tc.header != "" {
+			req.Header.Set("X-Store-Id", tc.header)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		_ = resp.Body.Close()
+		if got := resp.StatusCode != http.StatusUnauthorized; got != tc.admitted {
+			t.Errorf("%s: %s %s with %v: status %d, admitted=%v, want %v",
+				tc.name, tc.method, tc.path, tc.ents, resp.StatusCode, got, tc.admitted)
+		}
+	}
+}
+`
+	if err := os.WriteFile("cmd/bearer_placeholder_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+		return
+	}
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestBearerPlaceholders", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
+}
+
+// writeJWTProbeHelpers writes, into the generated function's cmd package, the
+// test JWKS and token minting that the security probes share: startTestJWKS
+// serves a fresh ES256 key and points the generated NewSecurity() at it, and
+// mintTestJWT signs a token for that key whose sub, aud, iss and iat are
+// valid, so a rejection is attributable to the claims a probe adds.
+func writeJWTProbeHelpers(t *testing.T) {
+	t.Helper()
+	helpers := `package main
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func startTestJWKS(t *testing.T) *ecdsa.PrivateKey {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b64 := base64.RawURLEncoding.EncodeToString
+	jwks := fmt.Sprintf(` + "`" + `{"keys":[{"kty":"EC","crv":"P-256","kid":"k","alg":"ES256","use":"sig","x":%q,"y":%q}]}` + "`" + `,
+		b64(priv.X.FillBytes(make([]byte, 32))), b64(priv.Y.FillBytes(make([]byte, 32))))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(jwks))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("AUDIENCE", "https://fn.example.test")
+	t.Setenv("ISSUER", "https://host.example.test")
+	t.Setenv("JWKS_URL", srv.URL)
+	return priv
+}
+
+func mintTestJWT(t *testing.T, priv *ecdsa.PrivateKey, extra jwt.MapClaims) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"sub": "alice", "aud": "https://fn.example.test", "iss": "https://host.example.test",
+		"iat": time.Now().Unix(),
+	}
+	for k, v := range extra {
+		claims[k] = v
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	tok.Header["kid"] = "k"
+	signed, err := tok.SignedString(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed
+}
+`
+	require.NoError(t, os.WriteFile("cmd/jwt_probe_helpers_test.go", []byte(helpers), 0644))
 }

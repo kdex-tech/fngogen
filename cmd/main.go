@@ -42,11 +42,14 @@ type MethodData struct {
 type TemplateData struct {
 	// APIImport is the import path of the ogen-generated api package
 	// (-api-import; function/api by default). See kdex-tech/fngogen#11.
-	APIImport             string
-	APIKeyCookieSecurity  bool
-	APIKeyHeaderSecurity  bool
-	APIKeyQuerySecurity   bool
-	BearerSecurity        bool
+	APIImport            string
+	APIKeyCookieSecurity bool
+	APIKeyHeaderSecurity bool
+	APIKeyQuerySecurity  bool
+	BearerSecurity       bool
+	// EntitlementBindings is every operation's x-entitlement-binding,
+	// keyed "METHOD /path". See kdex-tech/fngogen#15.
+	EntitlementBindings   map[string]map[string][]BindingSource
 	Methods               []MethodData
 	OAuth2Security        bool
 	OpenIdConnectSecurity bool
@@ -163,12 +166,18 @@ func run(args []string) error {
 		}
 	}
 
+	bindings, warnings := entitlementBindings(spec)
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
 	templateData := TemplateData{
 		APIImport:             *apiImportPtr,
 		APIKeyCookieSecurity:  apiKeyCookieSecurity,
 		APIKeyHeaderSecurity:  apiKeyHeaderSecurity,
 		APIKeyQuerySecurity:   apiKeyQuerySecurity,
 		BearerSecurity:        bearerSecurity,
+		EntitlementBindings:   bindings,
 		Methods:               methods,
 		OAuth2Security:        oauth2Security,
 		OpenIdConnectSecurity: openIdConnectSecurity,

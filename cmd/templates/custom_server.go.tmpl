@@ -8,6 +8,12 @@ listening: timeouts, ErrorLog, RegisterOnShutdown, TLS, and so on.
 
 The generated main.go has already set:
   - Addr from PORT;
+{{- if .Security}}
+  - Handler: the ogen server, wrapped so security requirements bind their
+    {placeholder}s from the request (kdex-tech/fngogen#15). Wrap
+    srv.Handler rather than replacing it, or every operation whose
+    requirements name a placeholder is refused;
+{{- end}}
   - ReadHeaderTimeout: 10s;
   - IdleTimeout: 120s;
   - no WriteTimeout, because it would cap every text/event-stream response.

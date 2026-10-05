@@ -44,7 +44,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%s", port),
-		Handler:           srv,
+		Handler:           {{if .Security}}bindRequestPlaceholders(srv){{else}}srv{{end}},
 		ReadHeaderTimeout: 10 * time.Second,
 		// Above Go's default client IdleConnTimeout (90s), so a client closes
 		// an idle keep-alive connection before the server does.
@@ -314,6 +314,104 @@ func RequestTokenFromContext(ctx context.Context) (string, bool) {
 	return tok, ok
 }
 
+// bindingSource is one link in a requirement placeholder's x-entitlement-binding
+// source chain: in is path, query or header. First match wins.
+type bindingSource struct {
+	in   string
+	name string
+}
+
+// entitlementBindings is every operation's x-entitlement-binding, keyed
+// "METHOD /path" -- the declaration host-manager's gate binds from.
+var entitlementBindings = map[string]map[string][]bindingSource{
+{{- range $route, $spec := .EntitlementBindings}}
+	{{printf "%q" $route}}: {
+	{{- range $key, $chain := $spec}}
+		{{printf "%q" $key}}: { {{- range $chain}}{ {{- printf "%q" .In}}, {{printf "%q" .Name -}} }, {{end -}} },
+	{{- end}}
+	},
+{{- end}}
+}
+
+type bindingContextKey struct{}
+
+// bindRequestPlaceholders resolves, for the operation a request matches, the
+// value of every {placeholder} its security requirements may name, and carries
+// them on the request context to the security handlers. ogen calls those with
+// the operation name only -- before it decodes parameters -- so this is where
+// the request is still in reach.
+//
+// A placeholder takes the first match of its x-entitlement-binding chain, else
+// the path parameter of the same name: the rules host-manager's gate binds by,
+// so the function checks the instance the gate admitted. A placeholder that
+// resolves to nothing is left out; BindRequirements then refuses the request
+// rather than letting a held wildcard match the unbound literal.
+// See kdex-tech/fngogen#15.
+func bindRequestPlaceholders(srv *api.Server) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if route, ok := srv.FindPath(r.Method, r.URL); ok {
+			b := requestBinding(r, route)
+			r = r.WithContext(context.WithValue(r.Context(), bindingContextKey{}, b))
+		}
+		srv.ServeHTTP(w, r)
+	})
+}
+
+func requestBinding(r *http.Request, route api.Route) entitlements.Binding {
+	// ogen's route args are the path parameter values, unescaped, in the
+	// order the pattern names them.
+	path := map[string]string{}
+	args := route.Args()
+	for i, name := range pathParamNames(route.PathPattern()) {
+		if i < len(args) && args[i] != "" {
+			path[name] = args[i]
+		}
+	}
+
+	spec := entitlementBindings[r.Method+" "+route.PathPattern()]
+	b := entitlements.Binding{}
+	for key, chain := range spec {
+		for _, src := range chain {
+			var v string
+			switch src.in {
+			case "path":
+				v = path[src.name]
+			case "query":
+				v = r.URL.Query().Get(src.name)
+			case "header":
+				v = r.Header.Get(src.name)
+			}
+			if v = strings.TrimSpace(v); v != "" {
+				b[key] = v
+				break
+			}
+		}
+	}
+	for name, v := range path {
+		if _, declared := spec[name]; !declared {
+			b[name] = v
+		}
+	}
+	return b
+}
+
+// pathParamNames returns the {name}s of an OpenAPI path pattern, in order.
+func pathParamNames(pattern string) []string {
+	var names []string
+	for {
+		open := strings.IndexByte(pattern, '{')
+		if open < 0 {
+			return names
+		}
+		end := strings.IndexByte(pattern[open:], '}')
+		if end < 0 {
+			return names
+		}
+		names = append(names, pattern[open+1:open+end])
+		pattern = pattern[open+end+1:]
+	}
+}
+
 {{if .APIKeyCookieSecurity}}
 func (s *security) HandleApiKeyCookie(ctx context.Context, operationName api.OperationName, t api.ApiKeyCookie) (context.Context, error) {
 	return s.handleApiKey(ctx, operationName, "apiKeyCookie", t.APIKey, t.Roles)
@@ -478,13 +576,22 @@ func (s *security) hasValidClaims(
 		},
 	}
 
-	if s.debug {
-		fmt.Println("[DEBUG] entitlements", ent)
-		fmt.Println("[DEBUG] requirements", req)
+	// Bind each {placeholder} to the instance this request addresses before
+	// verifying: unbound, it is a literal only a held wildcard satisfies. An
+	// unresolved placeholder refuses the request. See bindRequestPlaceholders.
+	binding, _ := ctx.Value(bindingContextKey{}).(entitlements.Binding)
+	bound, err := s.checker.BindRequirements(s.checker.ParseRequirements(req), binding)
+	if err != nil {
+		return nil, fmt.Errorf("requirements %v not bound for this request: %w", req, err)
 	}
 
-	if !s.checker.VerifyEntitlements(ent, req) {
-		return nil, fmt.Errorf("entitlements %v do not match requirements %v", ent, req)
+	if s.debug {
+		fmt.Println("[DEBUG] entitlements", ent)
+		fmt.Println("[DEBUG] requirements", req, "binding", binding)
+	}
+
+	if !s.checker.VerifyParsedEntitlements(s.checker.ParseEntitlements(ent), bound) {
+		return nil, fmt.Errorf("entitlements %v do not match requirements %v bound to %v", ent, req, binding)
 	}
 
 	return s.mergeClaims(ctx, claims), nil
