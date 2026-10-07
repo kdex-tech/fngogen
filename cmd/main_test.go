@@ -853,6 +853,16 @@ func TestBearerPlaceholders(t *testing.T) {
 		{"header outranks query", "POST", "/v1/stores?store=vs1", "vs2", []string{"stores:vs1:write"}, false},
 		{"unbound fails closed", "POST", "/v1/stores", "", []string{"stores:*:write"}, false},
 		{"wildcard value refused", "POST", "/v1/stores", "*", []string{"stores:*:write"}, false},
+		// The handler gets the raw value, so the raw value is what is checked.
+		{"padded value is another instance", "POST", "/v1/stores?store=vs1%20", "", []string{"stores:vs1:write"}, false},
+		{"padded value, its own grant", "POST", "/v1/stores?store=vs1%20", "", []string{"stores:vs1 :write"}, true},
+		// Each path segment is decoded exactly once, as the host gate does (#230).
+		{"double-encoded percent decoded once", "PUT", "/v1/roles/a%2525", "", []string{"roles:a%25:update"}, true},
+		{"double-encoded percent, not twice", "PUT", "/v1/roles/a%2525", "", []string{"roles:a%:update"}, false},
+		{"encoded slash stays in the segment", "PUT", "/v1/roles/a%2Fb", "", []string{"roles:a/b:update"}, true},
+		// A malformed declaration binds nothing: the same-named path parameter
+		// must not stand in for the header the author declared.
+		{"malformed binding does not fall back to path", "PUT", "/v1/vaults/v1", "", []string{"vaults:v1:update"}, false},
 	} {
 		req, err := http.NewRequest(tc.method, base+tc.path, nil)
 		if err != nil {
@@ -867,9 +877,17 @@ func TestBearerPlaceholders(t *testing.T) {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
 		_ = resp.Body.Close()
-		if got := resp.StatusCode != http.StatusUnauthorized; got != tc.admitted {
-			t.Errorf("%s: %s %s with %v: status %d, admitted=%v, want %v",
-				tc.name, tc.method, tc.path, tc.ents, resp.StatusCode, got, tc.admitted)
+		// Admitted means the request reached the generated stub, which
+		// answers 500 (not implemented); refused is ogen's 401. Anything else
+		// -- a 404 from a routing miss, a 400 -- is neither, so it must not
+		// count as a pass for either side.
+		want := http.StatusUnauthorized
+		if tc.admitted {
+			want = http.StatusInternalServerError
+		}
+		if resp.StatusCode != want {
+			t.Errorf("%s: %s %s with %v: status %d, want %d (admitted=%v)",
+				tc.name, tc.method, tc.path, tc.ents, resp.StatusCode, want, tc.admitted)
 		}
 	}
 }

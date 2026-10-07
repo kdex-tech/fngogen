@@ -24,7 +24,8 @@ func TestEntitlementBindings(t *testing.T) {
 				"put": {"x-entitlement-binding": {"store": [{"in": "path", "name": "id"}]}},
 				"delete": {"x-entitlement-binding": {"store": [{"in": "body", "name": "store"}]}},
 				"patch": {"x-entitlement-binding": {"store": []}},
-				"get": {"x-entitlement-binding": "store"}
+				"get": {"x-entitlement-binding": "store"},
+				"head": {"x-entitlement-binding": {}}
 			}
 		}
 	}`), &spec))
@@ -34,8 +35,13 @@ func TestEntitlementBindings(t *testing.T) {
 	assert.Equal(t, map[string]map[string][]BindingSource{
 		"POST /v1/stores":     {"store": {{In: "header", Name: "X-Store-Id"}, {In: "query", Name: "store"}}},
 		"PUT /v1/stores/{id}": {"store": {{In: "path", Name: "id"}}},
+		// A malformed declaration is kept as a route that binds NOTHING, so
+		// its placeholders stay unbound and the operation fails closed, even
+		// for a placeholder named like a path parameter -- the host gate's
+		// handling of the same CR.
+		"DELETE /v1/stores/{id}": nil,
+		"PATCH /v1/stores/{id}":  nil,
+		"GET /v1/stores/{id}":    nil,
 	}, got)
-	// A malformed declaration is dropped, so its placeholders stay unbound and
-	// the operation fails closed -- the host gate's handling of the same CR.
 	assert.Len(t, warnings, 3)
 }

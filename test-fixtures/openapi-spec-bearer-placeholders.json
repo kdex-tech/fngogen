@@ -124,6 +124,53 @@
           ]
         }
       }
+    },
+    "/v1/vaults/{vault}": {
+      "put": {
+        "operationId": "gen-v1-vaults-vault-put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Vault",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Updated"
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "vaults:{vault}:update"
+            ]
+          }
+        ],
+        "x-entitlement-binding": {
+          "vault": [
+            {
+              "in": "header",
+              "name": "X-Vault"
+            },
+            {
+              "in": "body",
+              "name": "vault"
+            }
+          ]
+        }
+      }
     }
   },
   "servers": [

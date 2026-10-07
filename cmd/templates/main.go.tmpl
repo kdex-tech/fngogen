@@ -322,7 +322,9 @@ type bindingSource struct {
 }
 
 // entitlementBindings is every operation's x-entitlement-binding, keyed
-// "METHOD /path" -- the declaration host-manager's gate binds from.
+// "METHOD /path" -- the declaration host-manager's gate binds from. An EMPTY
+// entry is a declaration the generator found malformed: that operation binds
+// nothing, so its placeholders fail closed.
 var entitlementBindings = map[string]map[string][]bindingSource{
 {{- range $route, $spec := .EntitlementBindings}}
 	{{printf "%q" $route}}: {
@@ -347,6 +349,15 @@ type bindingContextKey struct{}
 // resolves to nothing is left out; BindRequirements then refuses the request
 // rather than letting a held wildcard match the unbound literal.
 // See kdex-tech/fngogen#15.
+//
+// WORKAROUND for ogen, which runs at @latest (v1.24.0, the newest release as
+// of 2026-10-07): the generated SecurityHandler is called as
+// (ctx, operationName, token) BEFORE parameters are decoded (handlers.tmpl:
+// security at line 144, params at line 204), so it cannot see the request.
+// This wrapper re-matches the route with FindPath and relies on Route.Args()
+// returning the path values in pattern order, which ogen does not document.
+// No upstream issue asks for request or decoded-parameter access in the
+// security handler yet. Delete this wrapper once ogen passes either one to it.
 func bindRequestPlaceholders(srv *api.Server) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if route, ok := srv.FindPath(r.Method, r.URL); ok {
@@ -368,8 +379,13 @@ func requestBinding(r *http.Request, route api.Route) entitlements.Binding {
 		}
 	}
 
-	spec := entitlementBindings[r.Method+" "+route.PathPattern()]
+	spec, declared := entitlementBindings[r.Method+" "+route.PathPattern()]
 	b := entitlements.Binding{}
+	if declared && len(spec) == 0 {
+		// Malformed declaration: bind nothing, not even the path. See
+		// entitlementBindings.
+		return b
+	}
 	for key, chain := range spec {
 		for _, src := range chain {
 			var v string
@@ -381,7 +397,10 @@ func requestBinding(r *http.Request, route api.Route) entitlements.Binding {
 			case "header":
 				v = r.Header.Get(src.name)
 			}
-			if v = strings.TrimSpace(v); v != "" {
+			// Bind the raw value: the handler gets the raw value, so trimming
+			// would check "vs1" while the handler acts on " vs1 ". Only an
+			// empty value is absent, as on the host gate.
+			if v != "" {
 				b[key] = v
 				break
 			}
@@ -579,8 +598,14 @@ func (s *security) hasValidClaims(
 	// Bind each {placeholder} to the instance this request addresses before
 	// verifying: unbound, it is a literal only a held wildcard satisfies. An
 	// unresolved placeholder refuses the request. See bindRequestPlaceholders.
-	binding, _ := ctx.Value(bindingContextKey{}).(entitlements.Binding)
+	binding, ok := ctx.Value(bindingContextKey{}).(entitlements.Binding)
 	bound, err := s.checker.BindRequirements(s.checker.ParseRequirements(req), binding)
+	if err != nil && !ok {
+		// No binding on the context at all: the request never passed through
+		// bindRequestPlaceholders. A custom ServerConfig that replaces
+		// srv.Handler instead of wrapping it does exactly that.
+		return nil, fmt.Errorf("requirements %v not bound: no request binding (is srv.Handler wrapped, not replaced?): %w", req, err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("requirements %v not bound for this request: %w", req, err)
 	}

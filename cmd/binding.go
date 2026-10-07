@@ -22,10 +22,16 @@ type BindingSource struct {
 var bindingMethods = []string{"connect", "delete", "get", "head", "options", "patch", "post", "put", "trace"}
 
 // entitlementBindings collects every operation's x-entitlement-binding, keyed
-// "METHOD /path" like the host gate. A malformed declaration is left out and
-// reported as a warning, so its placeholders stay unbound and the operation
-// fails closed -- what the host does with the same CR. Only sources the
-// authorization layer can read are legal; a body source is not.
+// "METHOD /path" like the host gate. Only sources the authorization layer can
+// read are legal; a body source is not.
+//
+// A malformed declaration is reported as a warning and kept as a route with an
+// EMPTY spec, which the generated code reads as "bind nothing": its
+// placeholders stay unbound and the operation fails closed, even for one named
+// like a path parameter -- falling back to the path would bind a source the
+// author did not declare. That is what the host gate does with the same CR. A
+// valid but empty declaration declares nothing and is omitted, so an empty spec
+// always means malformed.
 func entitlementBindings(spec map[string]any) (map[string]map[string][]BindingSource, []string) {
 	bindings := map[string]map[string][]BindingSource{}
 	var warnings []string
@@ -45,9 +51,12 @@ func entitlementBindings(spec map[string]any) (map[string]map[string][]BindingSo
 			b, err := parseBindingSpec(raw)
 			if err != nil {
 				warnings = append(warnings, fmt.Sprintf("%s: invalid %s, its placeholders will not bind: %v", route, bindingExtensionKey, err))
+				bindings[route] = nil
 				continue
 			}
-			bindings[route] = b
+			if len(b) > 0 {
+				bindings[route] = b
+			}
 		}
 	}
 	return bindings, warnings
