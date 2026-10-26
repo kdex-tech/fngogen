@@ -4,6 +4,9 @@
       "BadRequest": {
         "description": "Bad Request"
       },
+      "Forbidden": {
+        "description": "Forbidden"
+      },
       "Found": {
         "description": "Found"
       },
@@ -233,9 +236,7 @@
           "tenant"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/tenant/v1/invitations/{invitationId}": {
@@ -307,9 +308,7 @@
           "tenant"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/tenant/v1/stores": {
@@ -345,9 +344,7 @@
           "tenant"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/tenant/v1/stores/{id}": {
@@ -417,9 +414,7 @@
           "tenant"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/tenant/v1/stores/{id}/invitations": {
@@ -468,9 +463,7 @@
           "tenant"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/tenant/v1/stores/{id}/invitations/{invitationId}": {
@@ -519,9 +512,7 @@
           "tenant"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/tenant/v1/stores/{id}/members": {
@@ -651,9 +642,7 @@
           "tenant"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/tenant/v1/stores/{id}/members/{userId}": {
@@ -770,9 +759,7 @@
           "tenant"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/tenant/v1/stores/{id}/membership": {
@@ -812,9 +799,7 @@
           "tenant"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     }
   },

@@ -26,15 +26,15 @@ fngogen local \
 
 What it does, all in-process:
 
-1. **Builds the one-off OpenAPI document** from the CR's `spec.api` — the same
-   transform host-manager runs (`internal/openapi` `BuildOneOff`, wrapping
-   paths/schemas into the full doc with `info`, `servers`, `x-kdex-*`
-   extensions, the standard `components.responses`, and only the security
-   schemes an operation actually references). It reuses the **same kin-openapi
-   library and marshaling** host-manager uses, so `openapi-spec.json` is
-   **byte-identical** to what the cluster commits (proven in
-   `cmd/oneoff_test.go` against real `knowdrive-site` functions). No churn when
-   the cluster regenerates.
+1. **Builds the one-off OpenAPI document** from the CR's `spec.api` with the
+   **same builder host-manager runs**, `kdex.dev/crds/openapi`
+   (`NewOneOffBuilder().BuildOneOff`). It wraps paths and schemas into the full
+   document with `info`, `servers`, `x-kdex-*` extensions, the standard
+   `components.responses`, and only the security schemes an operation actually
+   references. Because there is one implementation, `openapi-spec.json` is
+   **byte-identical** to what the cluster commits; `cmd/local_test.go` pins this
+   against real `knowdrive-site` functions. No churn when the cluster
+   regenerates.
 2. **Generates `api/`** by running **ogen as a library** (no `go run`, no
    network) — equivalent to `ogen --target api --clean openapi-spec.json`.
 3. **Renders `cmd/{main,default,custom}.go`** from the generated `Handler`

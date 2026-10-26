@@ -4,6 +4,9 @@
       "BadRequest": {
         "description": "Bad Request"
       },
+      "Forbidden": {
+        "description": "Forbidden"
+      },
       "Found": {
         "description": "Found"
       },
@@ -112,9 +115,7 @@
           "public"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/v1/auth/forgot-password": {
@@ -168,9 +169,7 @@
           "public"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/v1/auth/invite": {
@@ -221,9 +220,7 @@
           "public"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     },
     "/v1/auth/reset-password": {
@@ -267,9 +264,7 @@
           "public"
         ]
       },
-      "x-kdex-metadata": {
-        "contact": {}
-      },
+      "x-kdex-metadata": {},
       "x-kdex-type": "FUNCTION"
     }
   },
