@@ -4,7 +4,6 @@ go 1.26.0
 
 require (
 	github.com/Masterminds/sprig/v3 v3.3.0
-	github.com/getkin/kin-openapi v0.133.0
 	github.com/ogen-go/ogen v1.22.0
 	github.com/stretchr/testify v1.11.1
 	kdex.dev/crds v0.0.0-00010101000000-000000000000
@@ -21,6 +20,7 @@ require (
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
+	github.com/getkin/kin-openapi v0.133.0 // indirect
 	github.com/ghodss/yaml v1.0.0 // indirect
 	github.com/go-faster/errors v0.7.1 // indirect
 	github.com/go-faster/jx v1.2.0 // indirect
@@ -33,7 +33,7 @@ require (
 	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/kdex-tech/dmapper v0.1.1 // indirect
+	github.com/kdex-tech/dmapper v0.2.0 // indirect
 	github.com/mailru/easyjson v0.9.1 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
@@ -81,4 +81,4 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2 // indirect
 )
 
-replace kdex.dev/crds => github.com/kdex-tech/kdex-crds v0.14.230
+replace kdex.dev/crds => github.com/kdex-tech/kdex-crds v0.14.254-0.20261026161256-a3956bc4148e

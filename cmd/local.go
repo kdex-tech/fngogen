@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	kdexv1alpha1 "kdex.dev/crds/api/v1alpha1"
+	crdsopenapi "kdex.dev/crds/openapi"
 	"sigs.k8s.io/yaml"
 )
 
@@ -100,7 +101,8 @@ func runLocal(args []string) error {
 }
 
 // runBuildSpec resolves a KDexFunction CR's spec.api into the one-off OpenAPI
-// document and writes it (default: stdout). This is BuildOneOff on its own —
+// document and writes it (default: stdout). This is the shared one-off builder
+// (kdex.dev/crds/openapi, the one host-manager runs) on its own —
 // useful for inspecting or piping the doc without running the full pipeline.
 //
 //	fngogen build-spec --kdexfunction <cr.yaml> [--server-url URL] [-o out.json]
@@ -145,7 +147,7 @@ func oneOffFromCR(crPath, serverURL string) ([]byte, error) {
 		return nil, fmt.Errorf("%s is a %s, not a KDexFunction", crPath, fn.Kind)
 	}
 
-	doc := BuildOneOff(serverURL, &fn)
+	doc := crdsopenapi.NewOneOffBuilder().BuildOneOff(serverURL, &fn)
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal one-off doc: %w", err)
