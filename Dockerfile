@@ -41,12 +41,7 @@ COPY cmd/ cmd/
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-# Build the whole cmd package (not just main.go): the fngogen binary is now
-# multi-file (main.go + local.go / oneoff.go / ogenrun.go for the `fngogen
-# local` subcommand). Building a single file would fail with "undefined:
-# runLocal". The in-image entry-point still only uses the legacy `fngogen
-# --spec` template step, which is unchanged. See kdex-tech/fngogen#2.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags="-s -w" -a -o fngogen ./cmd; \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags="-s -w" -a -o fngogen ./cmd/; \
     mv fngogen /usr/local/bin/fngogen; \
     chmod 777 /usr/local/bin/fngogen
 

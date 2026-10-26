@@ -2,17 +2,21 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
 
-	"function/api"
+	"{{.APIImport}}"
 
 	{{if .Security}}
-	"context"
 	"strings"
-	"time"
 	"github.com/MicahParks/keyfunc/v2"
 	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
 	"aidanwoods.dev/go-paseto"
@@ -28,7 +32,7 @@ import (
 )
 
 func main() {
-	srv, err := api.NewServer(NewHandler(){{if .Security}}, NewSecurity(){{end}})
+	srv, err := api.NewServer(NewHandler(){{if .Raw}}, NewRawHandler(){{end}}{{if .Security}}, NewSecurity(), ServerOptions()...{{end}})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -36,9 +40,73 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	if err := http.ListenAndServe(fmt.Sprintf(":%s", port), srv); err != nil {
+	grace := shutdownGrace()
+
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%s", port),
+		Handler:           {{if .Security}}bindRequestPlaceholders(srv){{else}}srv{{end}},
+		ReadHeaderTimeout: 10 * time.Second,
+		// Above Go's default client IdleConnTimeout (90s), so a client closes
+		// an idle keep-alive connection before the server does.
+		IdleTimeout: 120 * time.Second,
+		// No WriteTimeout: it would cap every text/event-stream response.
+		// Set one in ServerConfig if this function needs it.
+	}
+	ServerConfig(server)
+
+	signals, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
+	served := make(chan error, 1)
+	go func() { served <- server.ListenAndServe() }()
+
+	select {
+	case err := <-served:
+		log.Fatal(err)
+	case <-signals.Done():
+	}
+	stop()
+
+	log.Printf("shutting down: draining in-flight requests for up to %s", grace)
+	close(shuttingDown)
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
+		log.Fatalf("shutdown grace of %s expired; closed the connections still open: %v", grace, err)
+	}
+	if err := <-served; !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+var shuttingDown = make(chan struct{})
+
+// ShuttingDown is closed when the function receives SIGTERM or SIGINT and
+// starts draining. A long-lived handler -- an event stream -- should select
+// on it and return, so the client reconnects to another instance; ordinary
+// requests just finish. Connections still open when the grace
+// (SHUTDOWN_GRACE_SECONDS) expires are closed and the process exits 1.
+// See kdex-tech/fngogen#12.
+func ShuttingDown() <-chan struct{} {
+	return shuttingDown
+}
+
+// shutdownGrace is how long SIGTERM waits for in-flight requests:
+// SHUTDOWN_GRACE_SECONDS, default 20s -- under Kubernetes' default 30s
+// terminationGracePeriodSeconds, so the process exits before SIGKILL.
+func shutdownGrace() time.Duration {
+	const defaultGrace = 20 * time.Second
+	v := os.Getenv("SHUTDOWN_GRACE_SECONDS")
+	if v == "" {
+		return defaultGrace
+	}
+	seconds, err := strconv.Atoi(v)
+	if err != nil || seconds < 0 {
+		log.Printf("ignoring invalid SHUTDOWN_GRACE_SECONDS=%q; using %s", v, defaultGrace)
+		return defaultGrace
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 {{if .Security}}
@@ -131,11 +199,6 @@ func NewSecurity() *security {
 // JWKS or the last error after maxAttempts. This is the startup-only
 // retry; once jwks is built, keyfunc handles periodic refresh internally
 // per RefreshInterval below.
-//
-// Note: this function deliberately avoids less-than / greater-than
-// comparison operators because fngogen renders this template with
-// html/template, which would HTML-escape them and break the generated
-// Go source. Use equality/inequality only.
 func fetchJWKSWithBackoff(jwksURL string) (*keyfunc.JWKS, error) {
 	const maxAttempts = 6
 	backoff := time.Second
@@ -239,8 +302,134 @@ func (p *pasetoPKs) refreshLoop() {
 type ContextKey string
 
 const (
-	UserContextKey ContextKey = "user"
+	UserContextKey         ContextKey = "user"
+	RequestTokenContextKey ContextKey = "request-token"
 )
+
+// RequestTokenFromContext returns the raw inbound bearer token carried on the
+// request, for handlers that need to exchange it for a token addressed to
+// another function (RFC 8693 token exchange via the host /-/token endpoint).
+func RequestTokenFromContext(ctx context.Context) (string, bool) {
+	tok, ok := ctx.Value(RequestTokenContextKey).(string)
+	return tok, ok
+}
+
+// bindingSource is one link in a requirement placeholder's x-entitlement-binding
+// source chain: in is path, query or header. First match wins.
+type bindingSource struct {
+	in   string
+	name string
+}
+
+// entitlementBindings is every operation's x-entitlement-binding, keyed
+// "METHOD /path" -- the declaration host-manager's gate binds from. An EMPTY
+// entry is a declaration the generator found malformed: that operation binds
+// nothing, so its placeholders fail closed.
+var entitlementBindings = map[string]map[string][]bindingSource{
+{{- range $route, $spec := .EntitlementBindings}}
+	{{printf "%q" $route}}: {
+	{{- range $key, $chain := $spec}}
+		{{printf "%q" $key}}: { {{- range $chain}}{ {{- printf "%q" .In}}, {{printf "%q" .Name -}} }, {{end -}} },
+	{{- end}}
+	},
+{{- end}}
+}
+
+type bindingContextKey struct{}
+
+// bindRequestPlaceholders resolves, for the operation a request matches, the
+// value of every {placeholder} its security requirements may name, and carries
+// them on the request context to the security handlers. ogen calls those with
+// the operation name only -- before it decodes parameters -- so this is where
+// the request is still in reach.
+//
+// A placeholder takes the first match of its x-entitlement-binding chain, else
+// the path parameter of the same name: the rules host-manager's gate binds by,
+// so the function checks the instance the gate admitted. A placeholder that
+// resolves to nothing is left out; BindRequirements then refuses the request
+// rather than letting a held wildcard match the unbound literal.
+// See kdex-tech/fngogen#15.
+//
+// WORKAROUND for ogen, which runs at @latest (v1.24.0, the newest release as
+// of 2026-10-07): the generated SecurityHandler is called as
+// (ctx, operationName, token) BEFORE parameters are decoded (handlers.tmpl:
+// security at line 144, params at line 204), so it cannot see the request.
+// This wrapper re-matches the route with FindPath and relies on Route.Args()
+// returning the path values in pattern order, which ogen does not document.
+// No upstream issue asks for request or decoded-parameter access in the
+// security handler yet. Delete this wrapper once ogen passes either one to it.
+func bindRequestPlaceholders(srv *api.Server) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if route, ok := srv.FindPath(r.Method, r.URL); ok {
+			b := requestBinding(r, route)
+			r = r.WithContext(context.WithValue(r.Context(), bindingContextKey{}, b))
+		}
+		srv.ServeHTTP(w, r)
+	})
+}
+
+func requestBinding(r *http.Request, route api.Route) entitlements.Binding {
+	// ogen's route args are the path parameter values, unescaped, in the
+	// order the pattern names them.
+	path := map[string]string{}
+	args := route.Args()
+	for i, name := range pathParamNames(route.PathPattern()) {
+		if i < len(args) && args[i] != "" {
+			path[name] = args[i]
+		}
+	}
+
+	spec, declared := entitlementBindings[r.Method+" "+route.PathPattern()]
+	b := entitlements.Binding{}
+	if declared && len(spec) == 0 {
+		// Malformed declaration: bind nothing, not even the path. See
+		// entitlementBindings.
+		return b
+	}
+	for key, chain := range spec {
+		for _, src := range chain {
+			var v string
+			switch src.in {
+			case "path":
+				v = path[src.name]
+			case "query":
+				v = r.URL.Query().Get(src.name)
+			case "header":
+				v = r.Header.Get(src.name)
+			}
+			// Bind the raw value: the handler gets the raw value, so trimming
+			// would check "vs1" while the handler acts on " vs1 ". Only an
+			// empty value is absent, as on the host gate.
+			if v != "" {
+				b[key] = v
+				break
+			}
+		}
+	}
+	for name, v := range path {
+		if _, declared := spec[name]; !declared {
+			b[name] = v
+		}
+	}
+	return b
+}
+
+// pathParamNames returns the {name}s of an OpenAPI path pattern, in order.
+func pathParamNames(pattern string) []string {
+	var names []string
+	for {
+		open := strings.IndexByte(pattern, '{')
+		if open < 0 {
+			return names
+		}
+		end := strings.IndexByte(pattern[open:], '}')
+		if end < 0 {
+			return names
+		}
+		names = append(names, pattern[open+1:open+end])
+		pattern = pattern[open+end+1:]
+	}
+}
 
 {{if .APIKeyCookieSecurity}}
 func (s *security) HandleApiKeyCookie(ctx context.Context, operationName api.OperationName, t api.ApiKeyCookie) (context.Context, error) {
@@ -308,35 +497,52 @@ func (s *security) handleApiKey(ctx context.Context, operationName api.Operation
 }
 {{end}}
 
+{{if or .BearerSecurity .OAuth2Security .OpenIdConnectSecurity}}
+// parseJWT verifies a JWT against the host's JWKS, audience and issuer, and
+// requires `exp`: golang-jwt treats it as optional, and reads `exp: 0` as
+// absent, so without this a token carrying either shape would never expire.
+// See kdex-tech/fngogen#13.
+func (s *security) parseJWT(tokenString string) (*jwt.Token, error) {
+	return jwt.Parse(tokenString, s.jwks.Keyfunc,
+		jwt.WithAudience(s.audience),
+		jwt.WithIssuer(s.issuer),
+		jwt.WithExpirationRequired(),
+	)
+}
+{{end}}
+
 {{if .BearerSecurity}}
 func (s *security) HandleBearer(ctx context.Context, operationName api.OperationName, t api.Bearer) (context.Context, error) {
-	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc, jwt.WithAudience(s.audience), jwt.WithIssuer(s.issuer))
+	token, err := s.parseJWT(t.Token)
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
+	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
 	return s.hasValidClaims(ctx, "entitlements", "bearer", t.Roles, token.Claims.(jwt.MapClaims))
 }
 {{end}}
 
 {{if .OAuth2Security}}	
 func (s *security) HandleOAuth2(ctx context.Context, operationName api.OperationName, t api.OAuth2) (context.Context, error) {
-	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc, jwt.WithAudience(s.audience), jwt.WithIssuer(s.issuer))
+	token, err := s.parseJWT(t.Token)
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
+	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
 	return s.hasValidClaims(ctx, "scopes", "oauth2", t.Scopes, token.Claims.(jwt.MapClaims))
 }
 {{end}}
 
 {{if .OpenIdConnectSecurity}}
 func (s *security) HandleOpenIdConnect(ctx context.Context, operationName api.OperationName, t api.OpenIdConnect) (context.Context, error) {
-	token, err := jwt.Parse(t.Token, s.jwks.Keyfunc, jwt.WithAudience(s.audience), jwt.WithIssuer(s.issuer))
+	token, err := s.parseJWT(t.Token)
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
+	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
 	return s.hasValidClaims(ctx, "scopes", "oidc", t.Scopes, token.Claims.(jwt.MapClaims))
 }
 {{end}}
@@ -389,13 +595,28 @@ func (s *security) hasValidClaims(
 		},
 	}
 
-	if s.debug {
-		fmt.Println("[DEBUG] entitlements", ent)
-		fmt.Println("[DEBUG] requirements", req)
+	// Bind each {placeholder} to the instance this request addresses before
+	// verifying: unbound, it is a literal only a held wildcard satisfies. An
+	// unresolved placeholder refuses the request. See bindRequestPlaceholders.
+	binding, ok := ctx.Value(bindingContextKey{}).(entitlements.Binding)
+	bound, err := s.checker.BindRequirements(s.checker.ParseRequirements(req), binding)
+	if err != nil && !ok {
+		// No binding on the context at all: the request never passed through
+		// bindRequestPlaceholders. A custom ServerConfig that replaces
+		// srv.Handler instead of wrapping it does exactly that.
+		return nil, fmt.Errorf("requirements %v not bound: no request binding (is srv.Handler wrapped, not replaced?): %w", req, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("requirements %v not bound for this request: %w", req, err)
 	}
 
-	if !s.checker.VerifyEntitlements(ent, req) {
-		return nil, fmt.Errorf("entitlements %v do not match requirements %v", ent, req)
+	if s.debug {
+		fmt.Println("[DEBUG] entitlements", ent)
+		fmt.Println("[DEBUG] requirements", req, "binding", binding)
+	}
+
+	if !s.checker.VerifyParsedEntitlements(s.checker.ParseEntitlements(ent), bound) {
+		return nil, fmt.Errorf("entitlements %v do not match requirements %v bound to %v", ent, req, binding)
 	}
 
 	return s.mergeClaims(ctx, claims), nil

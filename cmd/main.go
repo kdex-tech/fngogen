@@ -11,10 +11,10 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
-	"html/template"
 	"io"
 	"os"
 	"strings"
+	"text/template"
 
 	"github.com/Masterminds/sprig/v3"
 )
@@ -27,17 +27,39 @@ type MethodData struct {
 	FullParams string // e.g., "ctx context.Context, req api.OptUser"
 	ParamNames string // e.g., "ctx, req"
 	Returns    string // e.g., "(*api.User, error)"
+	// ReturnsError is true when the method returns only an error (a
+	// content-less OpenAPI response, which ogen renders as `Foo(ctx) error`).
+	// The stub return statement is two-valued for `(T, error)` but must be
+	// single-valued here, or the generated code won't compile (issue #3).
+	ReturnsError bool
+	// ResultType is T for a `(T, error)` method. The stub returns T's zero
+	// value: ogen renders some results as struct values (e.g. a single
+	// binary response), for which `return nil, ...` does not compile
+	// (issue #10).
+	ResultType string
 }
 
 type TemplateData struct {
-	APIKeyCookieSecurity  bool
-	APIKeyHeaderSecurity  bool
-	APIKeyQuerySecurity   bool
-	BearerSecurity        bool
+	// APIImport is the import path of the ogen-generated api package
+	// (-api-import; function/api by default). See kdex-tech/fngogen#11.
+	APIImport            string
+	APIKeyCookieSecurity bool
+	APIKeyHeaderSecurity bool
+	APIKeyQuerySecurity  bool
+	BearerSecurity       bool
+	// EntitlementBindings is every operation's x-entitlement-binding,
+	// keyed "METHOD /path". See kdex-tech/fngogen#15.
+	EntitlementBindings   map[string]map[string][]BindingSource
 	Methods               []MethodData
 	OAuth2Security        bool
 	OpenIdConnectSecurity bool
-	Security              bool
+	// Raw is true when ogen generated a RawHandler: operations whose
+	// response is marked x-ogen-raw-response (every text/event-stream
+	// response, see prepareSpec) are served by it with the
+	// http.ResponseWriter. See kdex-tech/fngogen#9.
+	Raw        bool
+	RawMethods []MethodData
+	Security   bool
 }
 
 //go:embed templates/main.go.tmpl
@@ -48,6 +70,12 @@ var defaultTemplate string
 
 //go:embed templates/custom.go.tmpl
 var customTemplate string
+
+//go:embed templates/custom_raw.go.tmpl
+var customRawTemplate string
+
+//go:embed templates/custom_server.go.tmpl
+var customServerTemplate string
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -80,53 +108,36 @@ func runTemplates(args []string) error {
 	flags.SetOutput(io.Discard)
 	targetPtr := flags.String("target", "cmd", "the target directory to generate the code")
 	specPtr := flags.String("spec", "api/openapi.json", "the path to the openapi spec")
+	preparePtr := flags.Bool("prepare", false, "rewrite the spec for ogen before generation, then exit (see prepareSpec)")
+	apiImportPtr := flags.String("api-import", defaultAPIImport, "import path of the ogen-generated api package, for a head inside an existing module")
 
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if err := validateAPIImport(*apiImportPtr); err != nil {
+		return err
+	}
 
-	return generateTemplates("api/oas_server_gen.go", *specPtr, *targetPtr)
+	if *preparePtr {
+		return prepareSpecFile(*specPtr)
+	}
+
+	return generateTemplates("api/oas_server_gen.go", *specPtr, *targetPtr, *apiImportPtr)
 }
 
 // generateTemplates renders cmd/{main,default,custom}.go from the ogen-generated
 // Handler interface at apiServerGenPath and the resolved spec at specPath, into
-// targetDir. Shared by the legacy `fngogen --spec` path and the `fngogen local`
-// pipeline.
-func generateTemplates(apiServerGenPath, specPath, targetDir string) error {
+// targetDir, importing the ogen package from apiImport. Shared by the legacy
+// `fngogen --spec` path and the `fngogen local` pipeline.
+func generateTemplates(apiServerGenPath, specPath, targetDir, apiImport string) error {
 	fset := token.NewFileSet()
 	node, err := parser.ParseFile(fset, apiServerGenPath, nil, parser.ParseComments)
 	if err != nil {
 		return err
 	}
 
-	var methods []MethodData
-
-	ast.Inspect(node, func(n ast.Node) bool {
-		ts, ok := n.(*ast.TypeSpec)
-		if !ok || ts.Name.Name != "Handler" {
-			return true
-		}
-		inter, ok := ts.Type.(*ast.InterfaceType)
-		if !ok {
-			return true
-		}
-
-		for _, method := range inter.Methods.List {
-			fType, ok := method.Type.(*ast.FuncType)
-			if !ok {
-				continue
-			}
-
-			fullParams, names := parseParams(fset, fType.Params)
-			methods = append(methods, MethodData{
-				Name:       method.Names[0].Name,
-				FullParams: fullParams,
-				ParamNames: strings.Join(names, ", "),
-				Returns:    stringifyFields(fset, fType.Results),
-			})
-		}
-		return false
-	})
+	methods := interfaceMethods(fset, node, "Handler")
+	rawMethods := interfaceMethods(fset, node, "RawHandler")
 
 	// read the openapi spec to check for all the security schemes implemented
 	if _, err := os.Stat(specPath); err != nil {
@@ -182,14 +193,23 @@ func generateTemplates(apiServerGenPath, specPath, targetDir string) error {
 		}
 	}
 
+	bindings, warnings := entitlementBindings(spec)
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
 	templateData := TemplateData{
+		APIImport:             apiImport,
 		APIKeyCookieSecurity:  apiKeyCookieSecurity,
 		APIKeyHeaderSecurity:  apiKeyHeaderSecurity,
 		APIKeyQuerySecurity:   apiKeyQuerySecurity,
 		BearerSecurity:        bearerSecurity,
+		EntitlementBindings:   bindings,
 		Methods:               methods,
 		OAuth2Security:        oauth2Security,
 		OpenIdConnectSecurity: openIdConnectSecurity,
+		Raw:                   len(rawMethods) > 0,
+		RawMethods:            rawMethods,
 		Security:              security,
 	}
 
@@ -208,8 +228,62 @@ func generateTemplates(apiServerGenPath, specPath, targetDir string) error {
 	if err := generateSourceFile(customTemplate, templateData, targetDir, "custom.go", false); err != nil {
 		return err
 	}
+	// ServerConfig, like NewRawHandler below, lives in its own
+	// never-overwritten file rather than in custom.go, so functions
+	// scaffolded before it existed still get it. See kdex-tech/fngogen#12.
+	if err := generateSourceFile(customServerTemplate, templateData, targetDir, "custom_server.go", false); err != nil {
+		return err
+	}
+	// NewRawHandler lives in its own never-overwritten file rather than in
+	// custom.go, so a function that gains its first event-stream operation
+	// after custom.go was scaffolded still gets the constructor.
+	if templateData.Raw {
+		if err := generateSourceFile(customRawTemplate, templateData, targetDir, "custom_raw.go", false); err != nil {
+			return err
+		}
+	}
 
 	return nil
+}
+
+// interfaceMethods returns the methods of the named interface type in the
+// ogen-generated server file (Handler, or RawHandler), or nil when the file
+// declares no such interface.
+func interfaceMethods(fset *token.FileSet, node *ast.File, name string) []MethodData {
+	var methods []MethodData
+	ast.Inspect(node, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != name {
+			return true
+		}
+		inter, ok := ts.Type.(*ast.InterfaceType)
+		if !ok {
+			return true
+		}
+
+		for _, method := range inter.Methods.List {
+			fType, ok := method.Type.(*ast.FuncType)
+			if !ok {
+				continue
+			}
+
+			fullParams, names := parseParams(fset, fType.Params)
+			results := fieldTypes(fset, fType.Results)
+			md := MethodData{
+				Name:         method.Names[0].Name,
+				FullParams:   fullParams,
+				ParamNames:   strings.Join(names, ", "),
+				Returns:      stringifyFields(fset, fType.Results),
+				ReturnsError: len(results) == 1,
+			}
+			if len(results) == 2 {
+				md.ResultType = results[0]
+			}
+			methods = append(methods, md)
+		}
+		return false
+	})
+	return methods
 }
 
 func generateSourceFile(templateString string, templateData TemplateData, outputDir string, outputFileName string, overwrite bool) error {
@@ -293,8 +367,17 @@ func parseParams(fset *token.FileSet, list *ast.FieldList) (string, []string) {
 }
 
 func stringifyFields(fset *token.FileSet, list *ast.FieldList) string {
+	parts := fieldTypes(fset, list)
+	if len(parts) > 1 {
+		return "(" + strings.Join(parts, ", ") + ")"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// fieldTypes renders each field's type, prefixed into the api package.
+func fieldTypes(fset *token.FileSet, list *ast.FieldList) []string {
 	if list == nil {
-		return ""
+		return nil
 	}
 	var parts []string
 	for _, f := range list.List {
@@ -305,8 +388,5 @@ func stringifyFields(fset *token.FileSet, list *ast.FieldList) string {
 		bString := strings.ReplaceAll(strings.ReplaceAll(b.String(), "\n", ""), "\t", "")
 		parts = append(parts, bString)
 	}
-	if len(parts) > 1 {
-		return "(" + strings.Join(parts, ", ") + ")"
-	}
-	return strings.Join(parts, ", ")
+	return parts
 }

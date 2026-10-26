@@ -24,15 +24,19 @@ const defaultServerURL = "http://localhost:8080"
 // round-trip. It is gen-only: it does NOT run go mod tidy / vet / fmt (that
 // needs the Go toolchain and is left to the caller). See kdex-tech/fngogen#2.
 //
-//	fngogen local --kdexfunction <cr.yaml> [--server-url URL] [--dir DIR]
-//	fngogen local --spec <openapi-spec.json>                   [--dir DIR]
+//	fngogen local --kdexfunction <cr.yaml> [--server-url URL] [--dir DIR] [--api-import PATH]
+//	fngogen local --spec <openapi-spec.json>                   [--dir DIR] [--api-import PATH]
 func runLocal(args []string) error {
 	flags := flag.NewFlagSet("local", flag.ContinueOnError)
 	crPath := flags.String("kdexfunction", "", "path to a KDexFunction CR YAML; its spec.api is resolved into the one-off OpenAPI doc")
 	specIn := flags.String("spec", "", "path to an already-resolved one-off openapi-spec.json (alternative to --kdexfunction)")
 	serverURL := flags.String("server-url", defaultServerURL, "servers[0].url in the generated doc (match your host for byte-identical output)")
 	dir := flags.String("dir", ".", "the function directory to generate into (holds openapi-spec.json, api/, cmd/)")
+	apiImport := flags.String("api-import", defaultAPIImport, "import path of the ogen-generated api package, for a head inside an existing module")
 	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if err := validateAPIImport(*apiImport); err != nil {
 		return err
 	}
 
@@ -67,6 +71,18 @@ func runLocal(args []string) error {
 		return fmt.Errorf("write %s: %w", specPath, err)
 	}
 
+	// Route text/event-stream responses to ogen's RawHandler, rewriting
+	// openapi-spec.json in place exactly as entry-point.sh's `fngogen --prepare`
+	// step does, so ogen and the templates see the same document the cluster
+	// commits. See kdex-tech/fngogen#9.
+	if err := prepareSpecFile(specPath); err != nil {
+		return fmt.Errorf("prepare %s: %w", specPath, err)
+	}
+	specData, err := os.ReadFile(specPath)
+	if err != nil {
+		return err
+	}
+
 	// 2. Generate api/ via ogen (in-process).
 	apiDir := filepath.Join(*dir, "api")
 	if err := generateAPI(specData, "api", apiDir); err != nil {
@@ -75,7 +91,7 @@ func runLocal(args []string) error {
 
 	// 3. Render cmd/{main,default,custom}.go from the generated Handler.
 	cmdDir := filepath.Join(*dir, "cmd")
-	if err := generateTemplates(filepath.Join(apiDir, "oas_server_gen.go"), specPath, cmdDir); err != nil {
+	if err := generateTemplates(filepath.Join(apiDir, "oas_server_gen.go"), specPath, cmdDir, *apiImport); err != nil {
 		return fmt.Errorf("templates: %w", err)
 	}
 

@@ -6,9 +6,12 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Test_run(t *testing.T) {
@@ -39,6 +42,11 @@ func Test_run(t *testing.T) {
 			openapi:   `../../test-fixtures/openapi-spec.json`,
 			workDir:   "t2",
 			targetDir: "test",
+		},
+		{
+			name:    "with content-less response",
+			openapi: `../../test-fixtures/openapi-spec-contentless.json`,
+			workDir: "t9",
 		},
 		{
 			name:    "with bearer security",
@@ -151,6 +159,194 @@ func Test_run(t *testing.T) {
 	}
 }
 
+// TestGenerate_BearerHandlerFlowsRawToken asserts the generated main.go
+// stashes the raw inbound bearer token on the context (RFC 8693 token
+// exchange support: a downstream handler/Exchange() call reads it back via
+// RequestTokenFromContext).
+func TestGenerate_BearerHandlerFlowsRawToken(t *testing.T) {
+	if _, err := os.Stat("../tmp"); err != nil {
+		if err := os.MkdirAll("../tmp", 0755); err != nil {
+			t.Fatalf("failed to create tmp dir: %v", err)
+		}
+	}
+
+	currentDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Could not get current directory: %v\n", err)
+	}
+
+	workDir := "t10"
+	if _, err := os.Stat("../tmp/" + workDir); err == nil {
+		if err := os.RemoveAll("../tmp/" + workDir); err != nil {
+			t.Fatalf("failed to remove work dir: %v", err)
+		}
+	}
+	if err := os.MkdirAll("../tmp/"+workDir, 0755); err != nil {
+		t.Fatalf("failed to create work dir: %v", err)
+	}
+	if err := os.Chdir("../tmp/" + workDir); err != nil {
+		t.Fatalf("Could not change directory: %v\n", err)
+	}
+	defer func() {
+		_ = os.Chdir(currentDir)
+	}()
+
+	goModInit := exec.Command("go", "mod", "init", "function")
+	if _, err := goModInit.Output(); !assert.NoError(t, err) {
+		return
+	}
+
+	openapi := "../../test-fixtures/openapi-spec-bearer.json"
+	generateFile := fmt.Sprintf(`package project
+
+//go:generate go run github.com/ogen-go/ogen/cmd/ogen@latest --target api --clean %s
+`, openapi)
+	if err := os.WriteFile("generate.go", []byte(generateFile), 0644); err != nil {
+		t.Fatalf("failed to write generate.go: %v", err)
+	}
+
+	goGenerate := exec.Command("go", "generate", "./...")
+	out, err := goGenerate.CombinedOutput()
+	if !assert.NoError(t, err, string(out)) {
+		return
+	}
+
+	if err := run([]string{"--spec", openapi}); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	generated, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	out2 := string(generated)
+
+	assert.Contains(t, out2, "RequestTokenContextKey ContextKey")
+	assert.Contains(t, out2, "func RequestTokenFromContext(ctx context.Context) (string, bool)")
+	// HandleBearer must put the raw token into the context it returns
+	assert.Contains(t, out2, "context.WithValue(ctx, RequestTokenContextKey, t.Token)")
+}
+
+// generateFixture drives the full ogen + fngogen generation for one fixture
+// into ../tmp/<workDir>, leaving the process chdir'd there (restored on
+// cleanup) so a focused generation test can read the generated files under
+// cmd/. It mirrors Test_run's per-case setup without repeating it.
+func generateFixture(t *testing.T, workDir, fixture string, runArgs ...string) {
+	t.Helper()
+	if err := os.MkdirAll("../tmp", 0755); err != nil {
+		t.Fatalf("failed to create tmp dir: %v", err)
+	}
+	currentDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Could not get current directory: %v", err)
+	}
+	if _, err := os.Stat("../tmp/" + workDir); err == nil {
+		if err := os.RemoveAll("../tmp/" + workDir); err != nil {
+			t.Fatalf("failed to remove work dir: %v", err)
+		}
+	}
+	if err := os.MkdirAll("../tmp/"+workDir, 0755); err != nil {
+		t.Fatalf("failed to create work dir: %v", err)
+	}
+	if err := os.Chdir("../tmp/" + workDir); err != nil {
+		t.Fatalf("Could not change directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(currentDir) })
+
+	// The module that owns the head: `function`, or the one -api-import
+	// implies, so the generated imports resolve and the result builds.
+	module := "function"
+	for i, a := range runArgs {
+		if a == "-api-import" && i+1 < len(runArgs) {
+			module = strings.TrimSuffix(runArgs[i+1], "/api")
+		}
+	}
+	if _, err := exec.Command("go", "mod", "init", module).Output(); err != nil {
+		t.Fatalf("go mod init: %v", err)
+	}
+	// Mirror entry-point.sh: the spec lands as openapi-spec.json, is prepared
+	// for ogen, then ogen and fngogen run over it.
+	spec, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if err := os.WriteFile("openapi-spec.json", spec, 0644); err != nil {
+		t.Fatalf("write openapi-spec.json: %v", err)
+	}
+	if err := run([]string{"--prepare", "--spec", "openapi-spec.json"}); err != nil {
+		t.Fatalf("run(--prepare) error = %v", err)
+	}
+	generateFile := `package project
+
+//go:generate go run github.com/ogen-go/ogen/cmd/ogen@latest --target api --clean openapi-spec.json
+`
+	if err := os.WriteFile("generate.go", []byte(generateFile), 0644); err != nil {
+		t.Fatalf("failed to write generate.go: %v", err)
+	}
+	if out, err := exec.Command("go", "generate", "./...").CombinedOutput(); err != nil {
+		t.Fatalf("go generate: %v\n%s", err, out)
+	}
+	if err := run(append([]string{"--spec", "openapi-spec.json"}, runArgs...)); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if out, err := exec.Command("go", "mod", "tidy").CombinedOutput(); err != nil {
+		t.Fatalf("go mod tidy: %v\n%s", err, out)
+	}
+}
+
+// TestGenerate_SecurityExposesServerOptionsSeam asserts that when a spec
+// declares security, generated main.go threads a hand-authored ServerOptions()
+// into api.NewServer alongside NewSecurity(), and the never-overwritten
+// custom.go scaffold defines that hook (defaulting to nil). This is the seam a
+// consumer needs to combine the generated security handler with custom ogen
+// ServerOptions such as api.WithMiddleware. Before the fix the security branch
+// emitted only NewServer(NewHandler(), NewSecurity()), with nowhere to pass an
+// option. See kdex-tech/fngogen#7.
+func TestGenerate_SecurityExposesServerOptionsSeam(t *testing.T) {
+	generateFixture(t, "t11", "../../test-fixtures/openapi-spec-bearer.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(mainSrc), "NewSecurity(), ServerOptions()...)",
+		"generated main.go must thread ServerOptions() into NewServer alongside NewSecurity()")
+
+	customSrc, err := os.ReadFile("cmd/custom.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(customSrc), "func ServerOptions() []api.ServerOption",
+		"custom.go scaffold must define the hand-authored ServerOptions hook")
+
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+// TestGenerate_NoSecurityOmitsServerOptionsSeam guards issue #7's backward-
+// compatibility promise: a spec with no security scheme is untouched. main.go
+// stays the bare NewServer(NewHandler()) — whose multi-value-return spread is
+// the existing options seam — and custom.go gains no ServerOptions hook. See
+// kdex-tech/fngogen#7.
+func TestGenerate_NoSecurityOmitsServerOptionsSeam(t *testing.T) {
+	generateFixture(t, "t12", "../../test-fixtures/openapi-spec.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.NotContains(t, string(mainSrc), "ServerOptions",
+		"non-security main.go must not reference ServerOptions — the NewHandler() spread is its seam")
+
+	customSrc, err := os.ReadFile("cmd/custom.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.NotContains(t, string(customSrc), "ServerOptions",
+		"non-security custom.go scaffold must be unchanged")
+}
+
 func Test_generateSourceFile(t *testing.T) {
 	err := generateSourceFile("{{.Name}}", TemplateData{}, "/invalid/path/that/does/not/exist", "out.go", true)
 	if err == nil {
@@ -215,4 +411,554 @@ func Test_parseParamsAndStringifyFields(t *testing.T) {
 	if str != "" {
 		t.Error("Expected empty result from nil field list")
 	}
+}
+
+// TestGenerate_SSEBuilds is kdex-tech/fngogen#9: a spec declaring
+// text/event-stream responses -- typed and untyped -- must generate a function
+// that builds. The prepared spec routes those operations to ogen's
+// RawHandler, which main.go must pass to api.NewServer, and whose constructor
+// lives in its own never-overwritten custom_raw.go.
+func TestGenerate_SSEBuilds(t *testing.T) {
+	generateFixture(t, "t13", "../../test-fixtures/openapi-spec-sse.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(mainSrc), "api.NewServer(NewHandler(), NewRawHandler())")
+
+	defaultSrc, err := os.ReadFile("cmd/default.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(defaultSrc), "var _ api.RawHandler = (*defaultRawHandler)(nil)")
+
+	customRawSrc, err := os.ReadFile("cmd/custom_raw.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(customRawSrc), "func NewRawHandler() api.RawHandler")
+	// Go source is rendered verbatim: the example's channel receives must not
+	// be HTML-escaped into "&lt;-".
+	assert.Contains(t, string(customRawSrc), "case <-ctx.Done():")
+
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+// TestGenerate_SSEWithSecurityBuilds covers the raw handler alongside the
+// generated security handler and the ServerOptions seam (#7).
+func TestGenerate_SSEWithSecurityBuilds(t *testing.T) {
+	generateFixture(t, "t14", "../../test-fixtures/openapi-spec-sse-bearer.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Contains(t, string(mainSrc), "api.NewServer(NewHandler(), NewRawHandler(), NewSecurity(), ServerOptions()...)")
+
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+// TestGenerate_SSEStreamsLiveAndIsGated drives the generated SSE function over
+// HTTP: an operation implemented the way custom_raw.go's example shows must be
+// security-gated and deliver each event as it is written, not at stream end.
+// ogen runs at @latest, so this also guards against an ogen release that stops
+// running security before raw handlers or breaks flushing through its
+// response-writer wrapper. See kdex-tech/fngogen#9.
+func TestGenerate_SSEStreamsLiveAndIsGated(t *testing.T) {
+	generateFixture(t, "t15", "../../test-fixtures/openapi-spec-sse-bearer.json")
+
+	probe := `package main
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"function/api"
+)
+
+type streamingHandler struct{ *defaultRawHandler }
+
+func (streamingHandler) GenV1EventsGet(ctx context.Context, w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+	for i := 0; i < 3; i++ {
+		if _, err := fmt.Fprintf(w, "data: %d\n\n", i); err != nil {
+			return err
+		}
+		if err := rc.Flush(); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
+type stubSecurity struct{}
+
+func (stubSecurity) HandleBearer(ctx context.Context, _ api.OperationName, t api.Bearer) (context.Context, error) {
+	if t.Token != "good" {
+		return nil, errors.New("bad token")
+	}
+	return ctx, nil
+}
+
+func TestSSE(t *testing.T) {
+	srv, err := api.NewServer(NewHandler(), streamingHandler{&defaultRawHandler{}}, stubSecurity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token: got %d, want 401", resp.StatusCode)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/events", nil)
+	req.Header.Set("Authorization", "Bearer good")
+	start := time.Now()
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("content type %q", ct)
+	}
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		if sc.Text() == "data: 0" {
+			if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+				t.Fatalf("first event arrived after %v: the stream is buffered", elapsed)
+			}
+			return
+		}
+	}
+	t.Fatal("no event received")
+}
+`
+	if err := os.WriteFile("cmd/sse_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+		return
+	}
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestSSE", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
+}
+
+// TestGenerate_NoSSEOmitsRawHandler guards #9's backward compatibility: a spec
+// with no event-stream response generates exactly as before.
+func TestGenerate_NoSSEOmitsRawHandler(t *testing.T) {
+	generateFixture(t, "t16", "../../test-fixtures/openapi-spec.json")
+
+	mainSrc, err := os.ReadFile("cmd/main.go")
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.NotContains(t, string(mainSrc), "RawHandler")
+	assert.NoFileExists(t, "cmd/custom_raw.go")
+}
+
+// TestGenerate_ValueTypeResultBuilds is kdex-tech/fngogen#10: ogen renders a
+// single binary response as a struct value (`(api.XxxOK, error)`), for which
+// the default stub's `return nil, ...` does not compile. The stub must return
+// the zero value of whatever the result type is.
+func TestGenerate_ValueTypeResultBuilds(t *testing.T) {
+	generateFixture(t, "t17", "../../test-fixtures/openapi-spec-binary.json")
+
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+// generatedFiles are the cmd/ files fngogen writes for an SSE spec: every file
+// that imports the ogen package.
+var generatedFiles = []string{"cmd/main.go", "cmd/default.go", "cmd/custom.go", "cmd/custom_raw.go"}
+
+func readGenerated(t *testing.T) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, f := range generatedFiles {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		out[f] = string(b)
+	}
+	return out
+}
+
+// TestGenerate_APIImportDefault pins kdex-tech/fngogen#11's backward
+// compatibility: without -api-import every generated file imports
+// function/api, exactly as before.
+func TestGenerate_APIImportDefault(t *testing.T) {
+	generateFixture(t, "t18", "../../test-fixtures/openapi-spec-sse-bearer.json")
+	for f, src := range readGenerated(t) {
+		assert.Contains(t, src, `"function/api"`, f)
+	}
+}
+
+// TestGenerate_APIImportFlag is #11: with -api-import every generated file --
+// including custom_raw.go, which has its own template (#9) -- imports the
+// given path, and nothing else in the output changes.
+func TestGenerate_APIImportFlag(t *testing.T) {
+	start, err := os.Getwd()
+	require.NoError(t, err)
+	generateFixture(t, "t19", "../../test-fixtures/openapi-spec-sse-bearer.json")
+	want := readGenerated(t)
+	require.NoError(t, os.Chdir(start)) // generateFixture paths are relative to cmd/
+
+	const path = "example.com/svc/head/api"
+	generateFixture(t, "t20", "../../test-fixtures/openapi-spec-sse-bearer.json", "-api-import", path)
+	got := readGenerated(t)
+
+	for _, f := range generatedFiles {
+		assert.Contains(t, got[f], `"`+path+`"`, f)
+		assert.NotContains(t, got[f], `"function/api"`, f)
+		// gofmt sorts imports, so the import line may move: compare with it
+		// removed from both sides.
+		assert.Equal(t, withoutLineContaining(want[f], `"function/api"`), withoutLineContaining(got[f], `"`+path+`"`),
+			"%s: only the import path may differ", f)
+	}
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+func withoutLineContaining(src, needle string) string {
+	var kept []string
+	for _, line := range strings.Split(src, "\n") {
+		if !strings.Contains(line, needle) {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+func TestRun_RejectsInvalidAPIImport(t *testing.T) {
+	err := run([]string{"--spec", "openapi-spec.json", "-api-import", "example.com/svc/oas"})
+	assert.ErrorContains(t, err, "api-import")
+}
+
+// TestEntryPoint_APIImportInsideExistingModule drives entry-point.sh the way
+// #11's caller does: TARGET_DIR is a subdirectory of an existing module and
+// API_IMPORT_PATH names its ogen package. No nested module may be created, the
+// enclosing module must build from its root, and the generated head must be
+// able to import the module's internal/ packages -- the point of #11.
+func TestEntryPoint_APIImportInsideExistingModule(t *testing.T) {
+	root := t.TempDir()
+	bin := t.TempDir()
+
+	build := exec.Command("go", "build", "-o", filepath.Join(bin, "fngogen"), ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fngogen: %v\n%s", err, out)
+	}
+
+	inRoot := func(name string, args ...string) *exec.Cmd {
+		c := exec.Command(name, args...)
+		c.Dir = root
+		return c
+	}
+	if out, err := inRoot("go", "mod", "init", "example.com/svc").CombinedOutput(); err != nil {
+		t.Fatalf("go mod init: %v\n%s", err, out)
+	}
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "internal", "greet"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "internal", "greet", "greet.go"),
+		[]byte("package greet\n\nfunc Hello() string { return \"hello\" }\n"), 0644))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "head"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".env"), nil, 0644))
+
+	spec, err := os.ReadFile("../test-fixtures/openapi-spec-sse-bearer.json")
+	require.NoError(t, err)
+
+	ep := inRoot("bash", mustAbs(t, "../entry-point.sh"))
+	ep.Env = append(os.Environ(),
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"WORKDIR="+root,
+		"TARGET_DIR=head",
+		"API_IMPORT_PATH=example.com/svc/head/api",
+		"FUNCTION_API_SPEC="+string(spec),
+	)
+	if out, err := ep.CombinedOutput(); err != nil {
+		t.Fatalf("entry-point.sh: %v\n%s", err, out)
+	}
+
+	assert.NoFileExists(t, filepath.Join(root, "head", "go.mod"), "the head must not become a nested module")
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "head", "cmd", "uses_internal.go"), []byte(`package main
+
+import "example.com/svc/internal/greet"
+
+var _ = greet.Hello
+`), 0644))
+	if out, err := inRoot("go", "build", "./...").CombinedOutput(); err != nil {
+		t.Fatalf("go build ./... from the module root: %v\n%s", err, out)
+	}
+}
+
+func mustAbs(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	require.NoError(t, err)
+	return abs
+}
+
+// TestGenerate_BearerRequiresExp is kdex-tech/fngogen#13: the generated JWT
+// security handlers must reject a token that never expires. golang-jwt v5
+// treats `exp` as optional unless required, and reads `exp: 0` as absent. The
+// probe drives the generated NewSecurity()/HandleBearer against a test JWKS;
+// each token is otherwise valid, so a rejection is attributable to `exp`.
+func TestGenerate_BearerRequiresExp(t *testing.T) {
+	generateFixture(t, "t24", "../../test-fixtures/openapi-spec-bearer.json")
+
+	writeJWTProbeHelpers(t)
+	probe := `package main
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+
+	"function/api"
+)
+
+func TestBearerExp(t *testing.T) {
+	priv := startTestJWKS(t)
+	s := NewSecurity()
+
+	mint := func(exp any, setExp bool) string {
+		claims := jwt.MapClaims{"entitlements": []string{}}
+		if setExp {
+			claims["exp"] = exp
+		}
+		return mintTestJWT(t, priv, claims)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		token    string
+		accepted bool
+	}{
+		{"valid exp", mint(time.Now().Add(time.Hour).Unix(), true), true},
+		{"no exp", mint(nil, false), false},
+		{"exp 0", mint(0, true), false},
+		{"expired", mint(time.Now().Add(-time.Hour).Unix(), true), false},
+	} {
+		_, err := s.HandleBearer(context.Background(), "op", api.Bearer{Token: tc.token})
+		if got := err == nil; got != tc.accepted {
+			t.Errorf("%s: accepted=%v, want %v (err: %v)", tc.name, got, tc.accepted, err)
+		}
+	}
+}
+`
+	if err := os.WriteFile("cmd/bearer_exp_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+		return
+	}
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestBearerExp", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
+}
+
+// TestGenerate_BearerBindsRequirementPlaceholders is kdex-tech/fngogen#15: the
+// generated security must bind each {placeholder} in an operation's
+// requirements from the request -- the op's x-entitlement-binding chain, else
+// the path parameter of the same name -- before verifying, exactly as the host
+// gate does. Unbound, `roles:{key}:update` is a literal that only a held
+// wildcard satisfies, so a per-instance grant the host admitted was refused
+// here. The probe runs the generated main() against a test JWKS and drives it
+// over HTTP, so the wiring in main.go is under test, not just the handler. A
+// denial is ogen's 401; an admitted request reaches the stub and fails 500.
+func TestGenerate_BearerBindsRequirementPlaceholders(t *testing.T) {
+	generateFixture(t, "t25", "../../test-fixtures/openapi-spec-bearer-placeholders.json")
+
+	writeJWTProbeHelpers(t)
+	probe := `package main
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestBearerPlaceholders(t *testing.T) {
+	priv := startTestJWKS(t)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	t.Setenv("PORT", fmt.Sprint(port))
+	go main()
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
+			_ = c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("function did not start listening")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	mint := func(ents ...string) string {
+		return mintTestJWT(t, priv, jwt.MapClaims{
+			"entitlements": ents, "exp": time.Now().Add(time.Hour).Unix(),
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		method   string
+		path     string
+		header   string
+		ents     []string
+		admitted bool
+	}{
+		{"per-instance grant", "PUT", "/v1/roles/analysts", "", []string{"roles:analysts:update"}, true},
+		{"other instance", "PUT", "/v1/roles/analysts", "", []string{"roles:engineers:update"}, false},
+		{"wildcard grant", "PUT", "/v1/roles/analysts", "", []string{"roles:*:update"}, true},
+		{"literal placeholder grant", "PUT", "/v1/roles/analysts", "", []string{"roles:{key}:update"}, false},
+		{"percent-encoded segment", "PUT", "/v1/roles/a%20b", "", []string{"roles:a b:update"}, true},
+		{"two placeholders", "PUT", "/v1/roles/analysts/members/u1", "", []string{"roles:analysts:update", "users:u1:update_roles"}, true},
+		{"two placeholders, wrong second", "PUT", "/v1/roles/analysts/members/u1", "", []string{"roles:analysts:update", "users:u2:update_roles"}, false},
+		{"declared header source", "POST", "/v1/stores", "vs1", []string{"stores:vs1:write"}, true},
+		{"declared query fallback", "POST", "/v1/stores?store=vs1", "", []string{"stores:vs1:write"}, true},
+		{"header outranks query", "POST", "/v1/stores?store=vs1", "vs2", []string{"stores:vs1:write"}, false},
+		{"unbound fails closed", "POST", "/v1/stores", "", []string{"stores:*:write"}, false},
+		{"wildcard value refused", "POST", "/v1/stores", "*", []string{"stores:*:write"}, false},
+		// The handler gets the raw value, so the raw value is what is checked.
+		{"padded value is another instance", "POST", "/v1/stores?store=vs1%20", "", []string{"stores:vs1:write"}, false},
+		{"padded value, its own grant", "POST", "/v1/stores?store=vs1%20", "", []string{"stores:vs1 :write"}, true},
+		// Each path segment is decoded exactly once, as the host gate does (#230).
+		{"double-encoded percent decoded once", "PUT", "/v1/roles/a%2525", "", []string{"roles:a%25:update"}, true},
+		{"double-encoded percent, not twice", "PUT", "/v1/roles/a%2525", "", []string{"roles:a%:update"}, false},
+		{"encoded slash stays in the segment", "PUT", "/v1/roles/a%2Fb", "", []string{"roles:a/b:update"}, true},
+		// A malformed declaration binds nothing: the same-named path parameter
+		// must not stand in for the header the author declared.
+		{"malformed binding does not fall back to path", "PUT", "/v1/vaults/v1", "", []string{"vaults:v1:update"}, false},
+	} {
+		req, err := http.NewRequest(tc.method, base+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+mint(tc.ents...))
+		if tc.header != "" {
+			req.Header.Set("X-Store-Id", tc.header)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		_ = resp.Body.Close()
+		// Admitted means the request reached the generated stub, which
+		// answers 500 (not implemented); refused is ogen's 401. Anything else
+		// -- a 404 from a routing miss, a 400 -- is neither, so it must not
+		// count as a pass for either side.
+		want := http.StatusUnauthorized
+		if tc.admitted {
+			want = http.StatusInternalServerError
+		}
+		if resp.StatusCode != want {
+			t.Errorf("%s: %s %s with %v: status %d, want %d (admitted=%v)",
+				tc.name, tc.method, tc.path, tc.ents, resp.StatusCode, want, tc.admitted)
+		}
+	}
+}
+`
+	if err := os.WriteFile("cmd/bearer_placeholder_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+		return
+	}
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestBearerPlaceholders", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
+}
+
+// writeJWTProbeHelpers writes, into the generated function's cmd package, the
+// test JWKS and token minting that the security probes share: startTestJWKS
+// serves a fresh ES256 key and points the generated NewSecurity() at it, and
+// mintTestJWT signs a token for that key whose sub, aud, iss and iat are
+// valid, so a rejection is attributable to the claims a probe adds.
+func writeJWTProbeHelpers(t *testing.T) {
+	t.Helper()
+	helpers := `package main
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func startTestJWKS(t *testing.T) *ecdsa.PrivateKey {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b64 := base64.RawURLEncoding.EncodeToString
+	jwks := fmt.Sprintf(` + "`" + `{"keys":[{"kty":"EC","crv":"P-256","kid":"k","alg":"ES256","use":"sig","x":%q,"y":%q}]}` + "`" + `,
+		b64(priv.X.FillBytes(make([]byte, 32))), b64(priv.Y.FillBytes(make([]byte, 32))))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(jwks))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("AUDIENCE", "https://fn.example.test")
+	t.Setenv("ISSUER", "https://host.example.test")
+	t.Setenv("JWKS_URL", srv.URL)
+	return priv
+}
+
+func mintTestJWT(t *testing.T, priv *ecdsa.PrivateKey, extra jwt.MapClaims) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"sub": "alice", "aud": "https://fn.example.test", "iss": "https://host.example.test",
+		"iat": time.Now().Unix(),
+	}
+	for k, v := range extra {
+		claims[k] = v
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	tok.Header["kid"] = "k"
+	signed, err := tok.SignedString(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed
+}
+`
+	require.NoError(t, os.WriteFile("cmd/jwt_probe_helpers_test.go", []byte(helpers), 0644))
 }
