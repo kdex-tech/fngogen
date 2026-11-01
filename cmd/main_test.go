@@ -83,7 +83,7 @@ func Test_run(t *testing.T) {
 		{
 			name:    "with openIdConnect security",
 			openapi: `../../test-fixtures/openapi-spec-openIdConnect.json`,
-			workDir: "t10",
+			workDir: "t21",
 		},
 	}
 	for _, tt := range tests {
@@ -927,6 +927,9 @@ func TestBearerAlternatives(t *testing.T) {
 		{"no entitlements", withEnts([]string{}), false},
 		{"space-separated string", withEnts("b c"), true},
 		{"no entitlements claim", mintTestJWT(t, priv, jwt.MapClaims{"exp": exp}), false},
+		// A nil slice marshals as JSON null, as a host-minted FAT for a subject
+		// with no grants can carry; it is an empty list, like a missing claim.
+		{"null entitlements claim", withEnts(nil), false},
 	} {
 		req, err := http.NewRequest("PUT", base+"/v1/users/u1", nil)
 		if err != nil {
@@ -989,6 +992,7 @@ func TestOptionalAuth(t *testing.T) {
 		{"token satisfying nothing", "/v1/users/u1", withEnts("x"), true},
 		{"token satisfying the alternative", "/v1/users/u1", withEnts("a"), true},
 		{"no entitlements claim", "/v1/users/u1", mintTestJWT(t, priv, jwt.MapClaims{"exp": exp}), true},
+		{"null entitlements claim", "/v1/users/u1", mintTestJWT(t, priv, jwt.MapClaims{"entitlements": nil, "exp": exp}), true},
 		{"bad signature", "/v1/users/u1", mintTestJWT(t, other, jwt.MapClaims{"entitlements": []string{"a"}, "exp": exp}), false},
 		{"second alternative", "/v1/roles/analysts", withEnts("z"), true},
 		{"bound first alternative", "/v1/roles/analysts", withEnts("roles:analysts:update"), true},
@@ -1143,6 +1147,7 @@ func TestGenerate_NonBearerSchemesAcceptOnlyTheFAT(t *testing.T) {
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -1185,7 +1190,6 @@ func TestNonBearer(t *testing.T) {
 	assertAdmitted(t, do("", func(r *http.Request) { r.URL.RawQuery = "api_token=v4.public.x" }), false, "api_token query")
 }
 `, tc.need, tc.apiKey, tc.method)
-			probe = strings.Replace(probe, "\t\"net/http\"", "\t\"net/http\"\n\t\"strings\"", 1)
 			require.NoError(t, os.WriteFile("cmd/non_bearer_probe_test.go", []byte(probe), 0644))
 			out, err := exec.Command("go", "test", "./cmd/", "-run", "TestNonBearer", "-count=1").CombinedOutput()
 			assert.NoError(t, err, string(out))

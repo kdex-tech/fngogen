@@ -395,11 +395,13 @@ func (s *security) authorize(ctx context.Context, claims jwt.MapClaims) (context
 		return nil, false, fmt.Errorf("missing required claim: sub")
 	}
 
-	// A token without the claim holds no entitlements; it still satisfies an
-	// alternative that asks for none.
+	// A token without the claim, or with it as JSON null (a nil slice marshals
+	// so), holds no entitlements; it still satisfies an alternative that asks
+	// for none.
 	var held []string
 	if raw, present := claims["entitlements"]; present {
 		switch v := raw.(type) {
+		case nil:
 		case string:
 			held = strings.Fields(v)
 		case []any:
