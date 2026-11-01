@@ -715,6 +715,24 @@ func TestEntryPoint_KeepsEntitlementsAtFloor(t *testing.T) {
 	assert.Equal(t, "v0.7.0", entitlementsVersion(t, root))
 }
 
+// TestEntitlementsNeedsRaise drives the floor comparison in entry-point.sh.
+// Pre-releases and pseudo-versions of the floor rank below it in semver, though
+// sort -V ranks them above.
+func TestEntitlementsNeedsRaise(t *testing.T) {
+	cases := map[string]bool{
+		"v0.6.0": true, "v0.7.0": false, "v0.7.0-rc.1": true,
+		"v0.7.0-0.20261101000000-abcdef123456": true,
+		"v0.7.1": false, "v0.10.0": false, "v0.6.9": true,
+	}
+	script := mustAbs(t, "../entry-point.sh")
+	for version, want := range cases {
+		c := exec.Command("bash", "-c", `source "$1" && entitlements_needs_raise "$2" v0.7.0`, "bash", script, version)
+		c.Env = append(os.Environ(), "ENTRY_POINT_FUNCTIONS_ONLY=1")
+		err := c.Run()
+		assert.Equal(t, want, err == nil, version)
+	}
+}
+
 func inDir(dir, name string, args ...string) *exec.Cmd {
 	c := exec.Command(name, args...)
 	c.Dir = dir
