@@ -229,3 +229,21 @@ Delete:
   - fnnodejsgen: `x-entitlement-binding` placeholder parity.
   - host-manager: should gate-bypassing tokens (exchanged FAT, client_credentials `resource`) carry the `functions:<basePath>:read` identity check?
 - [ ] **Step 3: Comment on fngogen#18** with the commit range and the follow-up links.
+
+### Task 4b: fngogen: generated functions require entitlements/go ≥ v0.7.0
+
+Added 2026-11-01 at the user's request: the fngogen release ships with entitlements v0.7.0. v0.7.0's Go API is call-compatible with what the template uses (`NewEntitlementsChecker`, `ParseRequirements`, `ParseEntitlements`, `BindRequirements`, `VerifyParsedEntitlements`).
+
+**Files:**
+- Modify: `entry-point.sh`. After `go mod tidy`, raise `github.com/kdex-tech/entitlements/go` to `v0.7.0` when the module's current version is lower (`go list -m -f '{{.Version}}' github.com/kdex-tech/entitlements/go`, compared semver-aware). **Never downgrade** a module that already requires a newer version. Then run `go mod tidy` again.
+- Modify: `cmd/main_test.go` `generateFixture`. Mirror the same raise, so the probes run against what entry-point produces.
+- Test: `cmd/main_test.go`.
+
+**Interfaces:** none new. Add the floor as one named value in `entry-point.sh` (`ENTITLEMENTS_MIN_VERSION=v0.7.0`) with a comment saying why, and mirror it as one named value in the test helper.
+
+- [ ] **Step 1: Write the failing test `TestGenerate_RaisesEntitlementsToFloor`.** In `generateFixture`'s flow, pre-seed the work dir's module with `require github.com/kdex-tech/entitlements/go v0.6.0` before generation. Generate the bearer fixture. Assert that `go list -m -f '{{.Version}}' github.com/kdex-tech/entitlements/go` prints `v0.7.0`.
+- [ ] **Step 2: Write `TestGenerate_KeepsEntitlementsAtFloor`.** Same, pre-seeded with `v0.7.0`: it stays `v0.7.0`. The never-downgrade branch, a version above the floor, cannot be exercised with a real module until a newer release exists. Implement the comparison with `sort -V` in entry-point.sh, and state that in a comment.
+- [ ] **Step 3: Run** `cd cmd && go test . -run 'TestGenerate_(Raises|Keeps)Entitlements' -count=1`. Expected: Raises FAILS (stays at v0.6.0), Keeps passes.
+- [ ] **Step 4: Implement** the entry-point.sh and generateFixture changes.
+- [ ] **Step 5: Run** the two tests plus `TestGenerate_BearerBindsRequirementPlaceholders`, then `GOTOOLCHAIN=go1.26.0 make lint`. Expected: PASS and `0 issues.`
+- [ ] **Step 6: Commit** `build: generated functions require entitlements/go v0.7.0`
