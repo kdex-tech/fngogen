@@ -679,42 +679,8 @@ func TestRun_RejectsInvalidAPIImport(t *testing.T) {
 // enclosing module must build from its root, and the generated head must be
 // able to import the module's internal/ packages -- the point of #11.
 func TestEntryPoint_APIImportInsideExistingModule(t *testing.T) {
-	root := t.TempDir()
-	bin := t.TempDir()
-
-	build := exec.Command("go", "build", "-o", filepath.Join(bin, "fngogen"), ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build fngogen: %v\n%s", err, out)
-	}
-
-	inRoot := func(name string, args ...string) *exec.Cmd {
-		c := exec.Command(name, args...)
-		c.Dir = root
-		return c
-	}
-	if out, err := inRoot("go", "mod", "init", "example.com/svc").CombinedOutput(); err != nil {
-		t.Fatalf("go mod init: %v\n%s", err, out)
-	}
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "internal", "greet"), 0755))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "internal", "greet", "greet.go"),
-		[]byte("package greet\n\nfunc Hello() string { return \"hello\" }\n"), 0644))
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "head"), 0755))
-	require.NoError(t, os.WriteFile(filepath.Join(root, ".env"), nil, 0644))
-
-	spec, err := os.ReadFile("../test-fixtures/openapi-spec-sse-bearer.json")
-	require.NoError(t, err)
-
-	ep := inRoot("bash", mustAbs(t, "../entry-point.sh"))
-	ep.Env = append(os.Environ(),
-		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"WORKDIR="+root,
-		"TARGET_DIR=head",
-		"API_IMPORT_PATH=example.com/svc/head/api",
-		"FUNCTION_API_SPEC="+string(spec),
-	)
-	if out, err := ep.CombinedOutput(); err != nil {
-		t.Fatalf("entry-point.sh: %v\n%s", err, out)
-	}
+	root := newEntryPointModule(t, "")
+	runEntryPoint(t, root, "../test-fixtures/openapi-spec-sse-bearer.json")
 
 	assert.NoFileExists(t, filepath.Join(root, "head", "go.mod"), "the head must not become a nested module")
 
@@ -724,8 +690,89 @@ import "example.com/svc/internal/greet"
 
 var _ = greet.Hello
 `), 0644))
-	if out, err := inRoot("go", "build", "./...").CombinedOutput(); err != nil {
+	if out, err := inDir(root, "go", "build", "./...").CombinedOutput(); err != nil {
 		t.Fatalf("go build ./... from the module root: %v\n%s", err, out)
+	}
+}
+
+const entitlementsModule = "github.com/kdex-tech/entitlements/go"
+
+// TestEntryPoint_RaisesEntitlementsToFloor: generated code imports the
+// entitlements library, so entry-point.sh must lift a lower pin to its
+// ENTITLEMENTS_MIN_VERSION floor (v0.7.0).
+func TestEntryPoint_RaisesEntitlementsToFloor(t *testing.T) {
+	root := newEntryPointModule(t, "v0.6.0")
+	runEntryPoint(t, root, "../test-fixtures/openapi-spec-bearer.json")
+	assert.Equal(t, "v0.7.0", entitlementsVersion(t, root))
+}
+
+// TestEntryPoint_KeepsEntitlementsAtFloor: a module already at the floor is
+// left alone. The never-downgrade branch (a version above the floor) cannot be
+// exercised with a real module until a release newer than v0.7.0 exists.
+func TestEntryPoint_KeepsEntitlementsAtFloor(t *testing.T) {
+	root := newEntryPointModule(t, "v0.7.0")
+	runEntryPoint(t, root, "../test-fixtures/openapi-spec-bearer.json")
+	assert.Equal(t, "v0.7.0", entitlementsVersion(t, root))
+}
+
+func inDir(dir, name string, args ...string) *exec.Cmd {
+	c := exec.Command(name, args...)
+	c.Dir = dir
+	return c
+}
+
+func entitlementsVersion(t *testing.T, root string) string {
+	t.Helper()
+	out, err := inDir(root, "go", "list", "-m", "-f", "{{.Version}}", entitlementsModule).CombinedOutput()
+	require.NoError(t, err, string(out))
+	return strings.TrimSpace(string(out))
+}
+
+// newEntryPointModule builds the existing module entry-point.sh runs inside:
+// example.com/svc with an internal/ package and an empty head/ directory. When
+// entitlementsPin is set, the module pre-requires that entitlements version.
+func newEntryPointModule(t *testing.T, entitlementsPin string) string {
+	t.Helper()
+	root := t.TempDir()
+	if out, err := inDir(root, "go", "mod", "init", "example.com/svc").CombinedOutput(); err != nil {
+		t.Fatalf("go mod init: %v\n%s", err, out)
+	}
+	if entitlementsPin != "" {
+		if out, err := inDir(root, "go", "mod", "edit", "-require", entitlementsModule+"@"+entitlementsPin).CombinedOutput(); err != nil {
+			t.Fatalf("go mod edit: %v\n%s", err, out)
+		}
+	}
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "internal", "greet"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "internal", "greet", "greet.go"),
+		[]byte("package greet\n\nfunc Hello() string { return \"hello\" }\n"), 0644))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "head"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".env"), nil, 0644))
+	return root
+}
+
+// runEntryPoint drives entry-point.sh the way #11's caller does: TARGET_DIR is
+// a subdirectory of the module at root and API_IMPORT_PATH names its ogen
+// package. fngogen is built into a temp bin dir placed on PATH.
+func runEntryPoint(t *testing.T, root, specPath string) {
+	t.Helper()
+	bin := t.TempDir()
+	build := exec.Command("go", "build", "-o", filepath.Join(bin, "fngogen"), ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fngogen: %v\n%s", err, out)
+	}
+	spec, err := os.ReadFile(specPath)
+	require.NoError(t, err)
+
+	ep := inDir(root, "bash", mustAbs(t, "../entry-point.sh"))
+	ep.Env = append(os.Environ(),
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"WORKDIR="+root,
+		"TARGET_DIR=head",
+		"API_IMPORT_PATH=example.com/svc/head/api",
+		"FUNCTION_API_SPEC="+string(spec),
+	)
+	if out, err := ep.CombinedOutput(); err != nil {
+		t.Fatalf("entry-point.sh: %v\n%s", err, out)
 	}
 }
 
