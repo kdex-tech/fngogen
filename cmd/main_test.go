@@ -899,6 +899,66 @@ func TestBearerPlaceholders(t *testing.T) {
 	assert.NoError(t, err, string(out))
 }
 
+// TestGenerate_OAuth2ReadsEntitlements is kdex-tech/fngogen#18: the generated
+// oauth2 handler must take the caller's entitlements from the claim the host
+// gate authorizes on, `entitlements`. It read `scopes`, which no host-minted
+// token carries, so every oauth2-only operation refused every caller. `scope`
+// must not stand in either: it is what the client asked for (a
+// client_credentials grant's scope is not filtered), which is why the host
+// gate keeps scope bucketing off.
+func TestGenerate_OAuth2ReadsEntitlements(t *testing.T) {
+	generateFixture(t, "t26", "../../test-fixtures/openapi-spec-oauth2.json")
+
+	writeJWTProbeHelpers(t)
+	probe := `package main
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+
+	"function/api"
+)
+
+func TestOAuth2Claim(t *testing.T) {
+	priv := startTestJWKS(t)
+	s := NewSecurity()
+	required := []string{"users:read", "users:write"}
+
+	mint := func(claims jwt.MapClaims) string {
+		claims["exp"] = time.Now().Add(time.Hour).Unix()
+		return mintTestJWT(t, priv, claims)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		claims   jwt.MapClaims
+		accepted bool
+	}{
+		{"entitlements", jwt.MapClaims{"entitlements": required}, true},
+		{"unrelated entitlements", jwt.MapClaims{"entitlements": []string{"orders:read"}}, false},
+		{"scope only", jwt.MapClaims{"scope": "users:read users:write"}, false},
+		{"scopes only", jwt.MapClaims{"scopes": required}, false},
+		{"scope does not add to entitlements", jwt.MapClaims{
+			"entitlements": []string{"orders:read"}, "scope": "users:read users:write",
+		}, false},
+	} {
+		_, err := s.HandleOAuth2(context.Background(), "op", api.OAuth2{Token: mint(tc.claims), Scopes: required})
+		if got := err == nil; got != tc.accepted {
+			t.Errorf("%s: accepted=%v, want %v (err: %v)", tc.name, got, tc.accepted, err)
+		}
+	}
+}
+`
+	if err := os.WriteFile("cmd/oauth2_claim_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+		return
+	}
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestOAuth2Claim", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
+}
+
 // writeJWTProbeHelpers writes, into the generated function's cmd package, the
 // test JWKS and token minting that the security probes share: startTestJWKS
 // serves a fresh ES256 key and points the generated NewSecurity() at it, and

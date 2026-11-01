@@ -530,8 +530,12 @@ func (s *security) HandleOAuth2(ctx context.Context, operationName api.Operation
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
+	// Entitlements, as for bearer: the host gate authorizes an oauth2
+	// requirement on the role-resolved entitlements, never on `scope`, which
+	// is what the client asked for (a client_credentials grant's scope is
+	// not filtered). See kdex-tech/fngogen#18.
 	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
-	return s.hasValidClaims(ctx, "scopes", "oauth2", t.Scopes, token.Claims.(jwt.MapClaims))
+	return s.hasValidClaims(ctx, "entitlements", "oauth2", t.Scopes, token.Claims.(jwt.MapClaims))
 }
 {{end}}
 
@@ -542,8 +546,9 @@ func (s *security) HandleOpenIdConnect(ctx context.Context, operationName api.Op
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 
+	// Entitlements, for the reason HandleOAuth2 gives.
 	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
-	return s.hasValidClaims(ctx, "scopes", "oidc", t.Scopes, token.Claims.(jwt.MapClaims))
+	return s.hasValidClaims(ctx, "entitlements", "oidc", t.Scopes, token.Claims.(jwt.MapClaims))
 }
 {{end}}
 
