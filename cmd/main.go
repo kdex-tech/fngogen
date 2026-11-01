@@ -42,24 +42,26 @@ type MethodData struct {
 type TemplateData struct {
 	// APIImport is the import path of the ogen-generated api package
 	// (-api-import; function/api by default). See kdex-tech/fngogen#11.
-	APIImport            string
-	APIKeyCookieSecurity bool
-	APIKeyHeaderSecurity bool
-	APIKeyQuerySecurity  bool
-	BearerSecurity       bool
+	APIImport string
 	// EntitlementBindings is every operation's x-entitlement-binding,
 	// keyed "METHOD /path". See kdex-tech/fngogen#15.
-	EntitlementBindings   map[string]map[string][]BindingSource
-	Methods               []MethodData
-	OAuth2Security        bool
-	OpenIdConnectSecurity bool
+	EntitlementBindings map[string]map[string][]BindingSource
+	Methods             []MethodData
+	// OperationRequirements is every operation's security alternatives,
+	// keyed "METHOD /path", which the generated HandleBearer authorizes
+	// from. See operationRequirements and kdex-tech/fngogen#18.
+	OperationRequirements map[string][][]string
 	// Raw is true when ogen generated a RawHandler: operations whose
 	// response is marked x-ogen-raw-response (every text/event-stream
 	// response, see prepareSpec) are served by it with the
 	// http.ResponseWriter. See kdex-tech/fngogen#9.
 	Raw        bool
 	RawMethods []MethodData
-	Security   bool
+	// Security is true when some operation declares a non-empty security
+	// alternative: exactly when ogen's NewServer takes a SecurityHandler. The
+	// presence of components.securitySchemes is not the test, because a
+	// prepared spec whose operations declare only {} keeps the schemes it had.
+	Security bool
 }
 
 //go:embed templates/main.go.tmpl
@@ -112,7 +114,7 @@ func run(args []string) error {
 	methods := interfaceMethods(fset, node, "Handler")
 	rawMethods := interfaceMethods(fset, node, "RawHandler")
 
-	// read the openapi spec to check for all the security schemes implemented
+	// read the openapi spec for its security requirements and bindings
 	if _, err := os.Stat(*specPtr); err != nil {
 		return err
 	}
@@ -127,63 +129,21 @@ func run(args []string) error {
 		return err
 	}
 
-	security := false
-	apiKeyCookieSecurity := false
-	apiKeyHeaderSecurity := false
-	apiKeyQuerySecurity := false
-	bearerSecurity := false
-	oauth2Security := false
-	openIdConnectSecurity := false
-	if spec["components"] != nil {
-		if components, ok := spec["components"].(map[string]any); ok {
-			if securitySchemes, ok := components["securitySchemes"].(map[string]any); ok {
-				if len(securitySchemes) > 0 {
-					security = true
-				}
-				for _, securityScheme := range securitySchemes {
-					if securityScheme.(map[string]any)["type"] == "apiKey" {
-						if securityScheme.(map[string]any)["in"] == "cookie" {
-							apiKeyCookieSecurity = true
-						}
-						if securityScheme.(map[string]any)["in"] == "header" {
-							apiKeyHeaderSecurity = true
-						}
-						if securityScheme.(map[string]any)["in"] == "query" {
-							apiKeyQuerySecurity = true
-						}
-					}
-					if securityScheme.(map[string]any)["type"] == "http" {
-						bearerSecurity = true
-					}
-					if securityScheme.(map[string]any)["type"] == "oauth2" {
-						oauth2Security = true
-					}
-					if securityScheme.(map[string]any)["type"] == "openIdConnect" {
-						openIdConnectSecurity = true
-					}
-				}
-			}
-		}
-	}
-
 	bindings, warnings := entitlementBindings(spec)
 	for _, w := range warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
 
+	requirements := operationRequirements(spec)
+
 	templateData := TemplateData{
 		APIImport:             *apiImportPtr,
-		APIKeyCookieSecurity:  apiKeyCookieSecurity,
-		APIKeyHeaderSecurity:  apiKeyHeaderSecurity,
-		APIKeyQuerySecurity:   apiKeyQuerySecurity,
-		BearerSecurity:        bearerSecurity,
 		EntitlementBindings:   bindings,
 		Methods:               methods,
-		OAuth2Security:        oauth2Security,
-		OpenIdConnectSecurity: openIdConnectSecurity,
+		OperationRequirements: requirements,
 		Raw:                   len(rawMethods) > 0,
 		RawMethods:            rawMethods,
-		Security:              security,
+		Security:              len(requirements) > 0,
 	}
 
 	if _, err := os.Stat(*targetPtr); err != nil {

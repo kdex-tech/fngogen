@@ -18,16 +18,9 @@ import (
 	{{if .Security}}
 	"strings"
 	"github.com/MicahParks/keyfunc/v2"
-	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-	"aidanwoods.dev/go-paseto"
-	"encoding/base64"
-	"encoding/json"
-	"sync"
-	{{end}}
-	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity .BearerSecurity .OAuth2Security}}
 	"github.com/golang-jwt/jwt/v5"
 	entitlements "github.com/kdex-tech/entitlements/go"
-	{{end}}
+	"github.com/ogen-go/ogen/ogenerrors"
 	{{end}}
 )
 
@@ -117,10 +110,6 @@ type security struct {
 	defaultSecurityScheme string
 	issuer string
 	jwks *keyfunc.JWKS
-	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-	pks *pasetoPKs
-	tokenPrefix string
-	{{end}}
 }
 
 func NewSecurity() *security {
@@ -155,24 +144,6 @@ func NewSecurity() *security {
 		log.Fatalf("failed to fetch JWKS from %s after retries: %v", jwksURL, err)
 	}
 
-	{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-	pksURL := os.Getenv("PKS_URL")
-	if pksURL == "" {
-		log.Fatal("PASETO_PKS_URL environment variable is required for security")
-	}
-	pks := &pasetoPKs{
-		ttl: 15 * time.Minute,
-		url: pksURL,
-	}
-	pks.refresh()
-	go pks.refreshLoop()
-
-	// PASETO_TOKEN_PREFIX is the host's white-label prefix. When set, the host
-	// minted API tokens with the "v4.public." header replaced by it; we restore
-	// the header before parsing. Empty (the default) means bare tokens.
-	tokenPrefix := os.Getenv("PASETO_TOKEN_PREFIX")
-	{{end}}
-
 	anonymousEntitlements := strings.Fields(os.Getenv("ANONYMOUS_ENTITLEMENTS"))
 
 	defaultSecurityScheme := os.Getenv("DEFAULT_SECURITY_SCHEME")
@@ -187,10 +158,6 @@ func NewSecurity() *security {
 		defaultSecurityScheme: defaultSecurityScheme,
 		issuer: issuer,
 		jwks: jwks,
-		{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-		pks: pks,
-		tokenPrefix: tokenPrefix,
-		{{end}}
 	}
 }
 
@@ -222,82 +189,6 @@ func fetchJWKSWithBackoff(jwksURL string) (*keyfunc.JWKS, error) {
 	}
 }
 
-{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-type pasetoPKs struct {
-	expiry time.Time
-	keys   map[string]*paseto.V4AsymmetricPublicKey
-	mu     sync.RWMutex
-	ttl    time.Duration
-	url    string
-}
-
-func (p *pasetoPKs) Get(kid string) (*paseto.V4AsymmetricPublicKey, bool) {
-	p.mu.RLock()
-	key, ok := p.keys[kid]
-	fresh := time.Now().Before(p.expiry)
-	p.mu.RUnlock()
-
-	if ok && fresh {
-		return key, true
-	}
-
-	p.refresh()
-
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	key, ok = p.keys[kid]
-	return key, ok
-}
-
-func (p *pasetoPKs) refresh() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	resp, err := http.Get(p.url)
-	if err != nil {
-		log.Printf("failed to fetch PASETO public keys from %s: %v", p.url, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	var data struct {
-		Keys []struct {
-			KID string `json:"kid"`
-			Key string `json:"key"`
-		} `json:"keys"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		log.Printf("failed to decode PASETO public keys: %v", err)
-		return
-	}
-
-	keys := make(map[string]*paseto.V4AsymmetricPublicKey)
-	for _, k := range data.Keys {
-		keyStr := strings.TrimPrefix(k.Key, "k4.public.")
-		pubBytes, err := base64.RawURLEncoding.DecodeString(keyStr)
-		if err != nil {
-			log.Printf("failed to decode PASETO public key %s: %v", k.KID, err)
-			continue
-		}
-		pubKey, err := paseto.NewV4AsymmetricPublicKeyFromBytes(pubBytes)
-		if err != nil {
-			log.Printf("failed to parse PASETO public key %s: %v", k.KID, err)
-			continue
-		}
-		keys[k.KID] = &pubKey
-	}
-	p.keys = keys
-	p.expiry = time.Now().Add(p.ttl)
-}
-
-func (p *pasetoPKs) refreshLoop() {
-	ticker := time.NewTicker(p.ttl)
-	defer ticker.Stop()
-	for range ticker.C {
-		p.refresh()
-	}
-}
-{{end}}
 
 type ContextKey string
 
@@ -335,13 +226,34 @@ var entitlementBindings = map[string]map[string][]bindingSource{
 {{- end}}
 }
 
+// operationRequirements is every operation's security alternatives, keyed
+// "METHOD /path" like entitlementBindings: one requirement list per non-empty
+// alternative of the spec, any one of which admits the call. An empty list
+// asks only for a valid token. An operation whose alternatives are all empty
+// ({}) has no entry. HandleBearer authorizes from this table, not from the
+// roles ogen passes it, because ogen merges same-scheme alternatives into a
+// single list that must hold in full. See kdex-tech/fngogen#18.
+var operationRequirements = map[string][][]string{
+{{- range $route, $alts := .OperationRequirements}}
+	{{printf "%q" $route}}: {
+	{{- range $alts}}
+		{ {{- range .}}{{printf "%q" .}}, {{end -}} },
+	{{- end}}
+	},
+{{- end}}
+}
+
 type bindingContextKey struct{}
+
+// routeKeyContextKey carries the "METHOD /path" key of the operation a request
+// matched, under which HandleBearer looks up operationRequirements.
+type routeKeyContextKey struct{}
 
 // bindRequestPlaceholders resolves, for the operation a request matches, the
 // value of every {placeholder} its security requirements may name, and carries
-// them on the request context to the security handlers. ogen calls those with
-// the operation name only -- before it decodes parameters -- so this is where
-// the request is still in reach.
+// them on the request context to the security handlers, with the operation's
+// route key. ogen calls those with the operation name only -- before it
+// decodes parameters -- so this is where the request is still in reach.
 //
 // A placeholder takes the first match of its x-entitlement-binding chain, else
 // the path parameter of the same name: the rules host-manager's gate binds by,
@@ -362,7 +274,9 @@ func bindRequestPlaceholders(srv *api.Server) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if route, ok := srv.FindPath(r.Method, r.URL); ok {
 			b := requestBinding(r, route)
-			r = r.WithContext(context.WithValue(r.Context(), bindingContextKey{}, b))
+			ctx := context.WithValue(r.Context(), bindingContextKey{}, b)
+			ctx = context.WithValue(ctx, routeKeyContextKey{}, r.Method+" "+route.PathPattern())
+			r = r.WithContext(ctx)
 		}
 		srv.ServeHTTP(w, r)
 	})
@@ -431,73 +345,6 @@ func pathParamNames(pattern string) []string {
 	}
 }
 
-{{if .APIKeyCookieSecurity}}
-func (s *security) HandleApiKeyCookie(ctx context.Context, operationName api.OperationName, t api.ApiKeyCookie) (context.Context, error) {
-	return s.handleApiKey(ctx, operationName, "apiKeyCookie", t.APIKey, t.Roles)
-}
-{{end}}
-
-{{if .APIKeyHeaderSecurity}}
-func (s *security) HandleApiKeyHeader(ctx context.Context, operationName api.OperationName, t api.ApiKeyHeader) (context.Context, error) {
-	return s.handleApiKey(ctx, operationName, "apiKeyHeader", t.APIKey, t.Roles)
-}
-{{end}}
-
-{{if .APIKeyQuerySecurity}}
-func (s *security) HandleApiKeyQuery(ctx context.Context, operationName api.OperationName, t api.ApiKeyQuery) (context.Context, error) {
-	return s.handleApiKey(ctx, operationName, "apiKeyQuery", t.APIKey, t.Roles)
-}
-{{end}}
-
-{{if or .APIKeyCookieSecurity .APIKeyHeaderSecurity .APIKeyQuerySecurity}}
-func (s *security) handleApiKey(ctx context.Context, operationName api.OperationName, scheme string, tokenString string, roles []string) (context.Context, error) {
-	// White-label: the host may have replaced the PASETO "v4.public." header
-	// with its brand prefix (PASETO_TOKEN_PREFIX). Restore the header before
-	// parsing so the signature verifies. A token that already starts with
-	// "v4.public." is bare and left untouched; anything else carrying the
-	// configured prefix has it swapped back for the header.
-	if s.tokenPrefix != "" && !strings.HasPrefix(tokenString, "v4.public.") && strings.HasPrefix(tokenString, s.tokenPrefix) {
-		tokenString = "v4.public." + tokenString[len(s.tokenPrefix):]
-	}
-
-	parser := paseto.NewParser()
-	footerBytes, err := parser.UnsafeParseFooter(paseto.V4Public, tokenString)
-	if err != nil {
-		return nil, fmt.Errorf("invalid token footer: %w", err)
-	}
-
-	var footerData struct {
-		KID string `json:"kid"`
-	}
-	if err := json.Unmarshal(footerBytes, &footerData); err != nil {
-		return nil, fmt.Errorf("invalid footer JSON: %w", err)
-	}
-
-	pubKey, ok := s.pks.Get(footerData.KID)
-	if !ok {
-		return nil, fmt.Errorf("unknown key ID: %s", footerData.KID)
-	}
-
-	parser.AddRule(paseto.NotExpired())
-	parser.AddRule(paseto.ValidAt(time.Now()))
-	parser.AddRule(paseto.ForAudience(s.audience))
-	parser.AddRule(paseto.IssuedBy(s.issuer))
-
-	token, err := parser.ParseV4Public(*pubKey, tokenString, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate PASETO: %w", err)
-	}
-
-	claims := jwt.MapClaims{}
-	for k, v := range token.Claims() {
-		claims[k] = v
-	}
-
-	return s.hasValidClaims(ctx, "scp", scheme, roles, claims)
-}
-{{end}}
-
-{{if or .BearerSecurity .OAuth2Security .OpenIdConnectSecurity}}
 // parseJWT verifies a JWT against the host's JWKS, audience and issuer, and
 // requires `exp`: golang-jwt treats it as optional, and reads `exp: 0` as
 // absent, so without this a token carrying either shape would never expire.
@@ -509,9 +356,17 @@ func (s *security) parseJWT(tokenString string) (*jwt.Token, error) {
 		jwt.WithExpirationRequired(),
 	)
 }
-{{end}}
 
-{{if .BearerSecurity}}
+// HandleBearer is the function's only security handler: whatever schemes the
+// spec declares, the one credential a generated function accepts is the
+// host-minted Function Access Token, and its only authority is the token's
+// `entitlements` claim (fngogen --prepare rewrites every scheme to bearer).
+//
+// A token that fails verification is an error, which ogen answers with 401. A
+// valid token that satisfies none of the operation's alternatives is skipped
+// (ogenerrors.ErrSkipServerSecurity): ogen then answers 401 unless the
+// operation also declares an empty alternative ({}), in which case the call
+// proceeds as anonymous, without the token's claims. See kdex-tech/fngogen#18.
 func (s *security) HandleBearer(ctx context.Context, operationName api.OperationName, t api.Bearer) (context.Context, error) {
 	token, err := s.parseJWT(t.Token)
 	if err != nil || !token.Valid {
@@ -519,112 +374,86 @@ func (s *security) HandleBearer(ctx context.Context, operationName api.Operation
 	}
 
 	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
-	return s.hasValidClaims(ctx, "entitlements", "bearer", t.Roles, token.Claims.(jwt.MapClaims))
-}
-{{end}}
-
-{{if .OAuth2Security}}	
-func (s *security) HandleOAuth2(ctx context.Context, operationName api.OperationName, t api.OAuth2) (context.Context, error) {
-	token, err := s.parseJWT(t.Token)
-	if err != nil || !token.Valid {
-		return nil, fmt.Errorf("invalid token: %w", err)
+	ctx, ok, err := s.authorize(ctx, token.Claims.(jwt.MapClaims))
+	if err != nil {
+		return nil, err
 	}
-
-	// Entitlements, as for bearer: the host gate authorizes an oauth2
-	// requirement on the role-resolved entitlements, never on `scope`, which
-	// is what the client asked for (a client_credentials grant's scope is
-	// not filtered). See kdex-tech/fngogen#18.
-	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
-	return s.hasValidClaims(ctx, "entitlements", "oauth2", t.Scopes, token.Claims.(jwt.MapClaims))
-}
-{{end}}
-
-{{if .OpenIdConnectSecurity}}
-func (s *security) HandleOpenIdConnect(ctx context.Context, operationName api.OperationName, t api.OpenIdConnect) (context.Context, error) {
-	token, err := s.parseJWT(t.Token)
-	if err != nil || !token.Valid {
-		return nil, fmt.Errorf("invalid token: %w", err)
+	if !ok {
+		return nil, ogenerrors.ErrSkipServerSecurity
 	}
-
-	// Entitlements, for the reason HandleOAuth2 gives.
-	ctx = context.WithValue(ctx, RequestTokenContextKey, t.Token)
-	return s.hasValidClaims(ctx, "entitlements", "oidc", t.Scopes, token.Claims.(jwt.MapClaims))
+	return ctx, nil
 }
-{{end}}
 
-func (s *security) hasValidClaims(
-	ctx context.Context, claim string, scheme string, requirements []string, claims jwt.MapClaims,
-) (context.Context, error) {
+// authorize checks the token's entitlements against each of the requested
+// operation's alternatives in operationRequirements, and returns ctx carrying
+// the claims when one is satisfied. ok == false with a nil error means no
+// alternative is satisfied; an error means the claims are malformed or the
+// request never passed through bindRequestPlaceholders.
+func (s *security) authorize(ctx context.Context, claims jwt.MapClaims) (context.Context, bool, error) {
 	if claims == nil {
-		return nil, fmt.Errorf("missing required claims")
+		return nil, false, fmt.Errorf("missing required claims")
 	}
 
 	if s.debug {
 		fmt.Println("[DEBUG] claims", claims)
 	}
 
-	_, ok := claims["sub"].(string)
-	if !ok {
-		return nil, fmt.Errorf("missing required claim: sub")
+	if _, ok := claims["sub"].(string); !ok {
+		return nil, false, fmt.Errorf("missing required claim: sub")
 	}
 
-	var claimValues []string
-	claimValuesRaw, ok := claims[claim]
-
-	if !ok {
-		return nil, fmt.Errorf("missing required claim: %s", claim)
-	}
-
-	switch v := claimValuesRaw.(type) {
-	case string:
-		claimValues = strings.Fields(v)
-	case []string:
-		claimValues = v
-	case []any:
-		claimValues = make([]string, 0, len(v))
-		for _, e := range v {
-			if s, ok := e.(string); ok {
-				claimValues = append(claimValues, strings.TrimSpace(s))
+	// A token without the claim holds no entitlements; it still satisfies an
+	// alternative that asks for none.
+	var held []string
+	if raw, present := claims["entitlements"]; present {
+		switch v := raw.(type) {
+		case string:
+			held = strings.Fields(v)
+		case []any:
+			held = make([]string, 0, len(v))
+			for _, e := range v {
+				if str, ok := e.(string); ok {
+					held = append(held, strings.TrimSpace(str))
+				}
 			}
+		default:
+			return nil, false, fmt.Errorf("unknown assertion type: %T for claim: entitlements", v)
 		}
-	default:
-		return nil, fmt.Errorf("unknown assertion type: %T for claim: %s", v, claim)
 	}
 
-	ent := entitlements.Entitlements{
-		scheme: claimValues,
+	// Both keys are set together by bindRequestPlaceholders. A custom
+	// ServerConfig that replaces srv.Handler instead of wrapping it sets
+	// neither, and the operation's requirements cannot be found.
+	route, ok := ctx.Value(routeKeyContextKey{}).(string)
+	if !ok {
+		return nil, false, fmt.Errorf("no request binding (is srv.Handler wrapped, not replaced?)")
 	}
-	req := entitlements.Requirements{
-		map[string][]string{
-			scheme: requirements,
-		},
-	}
+	binding, _ := ctx.Value(bindingContextKey{}).(entitlements.Binding)
 
-	// Bind each {placeholder} to the instance this request addresses before
-	// verifying: unbound, it is a literal only a held wildcard satisfies. An
-	// unresolved placeholder refuses the request. See bindRequestPlaceholders.
-	binding, ok := ctx.Value(bindingContextKey{}).(entitlements.Binding)
-	bound, err := s.checker.BindRequirements(s.checker.ParseRequirements(req), binding)
-	if err != nil && !ok {
-		// No binding on the context at all: the request never passed through
-		// bindRequestPlaceholders. A custom ServerConfig that replaces
-		// srv.Handler instead of wrapping it does exactly that.
-		return nil, fmt.Errorf("requirements %v not bound: no request binding (is srv.Handler wrapped, not replaced?): %w", req, err)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("requirements %v not bound for this request: %w", req, err)
+	ent := s.checker.ParseEntitlements(entitlements.Entitlements{"bearer": held})
+	for _, alt := range operationRequirements[route] {
+		req := entitlements.Requirements{map[string][]string{"bearer": alt}}
+		// Bind each {placeholder} to the instance this request addresses before
+		// verifying: unbound, it is a literal only a held wildcard satisfies. An
+		// alternative whose placeholder does not resolve is not satisfied, but
+		// does not stop the next one from admitting. See
+		// bindRequestPlaceholders.
+		bound, err := s.checker.BindRequirements(s.checker.ParseRequirements(req), binding)
+		if err != nil {
+			if s.debug {
+				fmt.Println("[DEBUG] requirements", req, "not bound to", binding, ":", err)
+			}
+			continue
+		}
+		if s.checker.VerifyParsedEntitlements(ent, bound) {
+			return s.mergeClaims(ctx, claims), true, nil
+		}
 	}
 
 	if s.debug {
-		fmt.Println("[DEBUG] entitlements", ent)
-		fmt.Println("[DEBUG] requirements", req, "binding", binding)
+		fmt.Println("[DEBUG] entitlements", held, "satisfy none of", operationRequirements[route], "bound to", binding)
 	}
-
-	if !s.checker.VerifyParsedEntitlements(s.checker.ParseEntitlements(ent), bound) {
-		return nil, fmt.Errorf("entitlements %v do not match requirements %v bound to %v", ent, req, binding)
-	}
-
-	return s.mergeClaims(ctx, claims), nil
+	return nil, false, nil
 }
 
 func (s *security) mergeClaims(ctx context.Context, newClaims jwt.MapClaims) context.Context {

@@ -110,10 +110,26 @@ func Test_run(t *testing.T) {
 				return
 			}
 
+			// Mirror entry-point.sh, as generateFixture does: the spec lands as
+			// openapi-spec.json and is prepared for ogen before generation.
+			// Unprepared, an apiKey or oauth2 fixture makes ogen expect a
+			// security handler the generated main.go no longer has.
+			const specFile = "openapi-spec.json"
+			spec, err := os.ReadFile(tt.openapi)
+			if !assert.NoError(t, err) {
+				return
+			}
+			if err := os.WriteFile(specFile, spec, 0644); err != nil {
+				t.Fatalf("failed to write %s: %v", specFile, err)
+			}
+			if err := run([]string{"--prepare", "--spec", specFile}); err != nil {
+				t.Fatalf("run(--prepare) error = %v", err)
+			}
+
 			generateFile := fmt.Sprintf(`package project
 
 //go:generate go run github.com/ogen-go/ogen/cmd/ogen@latest --target api --clean %s
-`, tt.openapi)
+`, specFile)
 			if err := os.WriteFile("generate.go", []byte(generateFile), 0644); err != nil {
 				t.Fatalf("failed to write generate.go: %v", err)
 			}
@@ -124,12 +140,9 @@ func Test_run(t *testing.T) {
 				return
 			}
 
-			args := []string{}
+			args := []string{"--spec", specFile}
 			if tt.targetDir != "" {
 				args = append(args, "--target", tt.targetDir)
-			}
-			if tt.openapi != "" {
-				args = append(args, "--spec", tt.openapi)
 			}
 
 			targetDir := tt.targetDir
@@ -726,7 +739,10 @@ func mustAbs(t *testing.T, p string) string {
 // security handlers must reject a token that never expires. golang-jwt v5
 // treats `exp` as optional unless required, and reads `exp: 0` as absent. The
 // probe drives the generated NewSecurity()/HandleBearer against a test JWKS;
-// each token is otherwise valid, so a rejection is attributable to `exp`.
+// each token is otherwise valid and satisfies the operation, so a rejection is
+// attributable to `exp`. A rejection must be a hard error, never a skip: on an
+// operation that also admits anonymous callers, a skip would let a token that
+// never expires through. See kdex-tech/fngogen#18.
 func TestGenerate_BearerRequiresExp(t *testing.T) {
 	generateFixture(t, "t24", "../../test-fixtures/openapi-spec-bearer.json")
 
@@ -735,10 +751,13 @@ func TestGenerate_BearerRequiresExp(t *testing.T) {
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	entitlements "github.com/kdex-tech/entitlements/go"
+	"github.com/ogen-go/ogen/ogenerrors"
 
 	"function/api"
 )
@@ -748,12 +767,15 @@ func TestBearerExp(t *testing.T) {
 	s := NewSecurity()
 
 	mint := func(exp any, setExp bool) string {
-		claims := jwt.MapClaims{"entitlements": []string{}}
+		claims := jwt.MapClaims{"entitlements": []string{"foo", "bar"}}
 		if setExp {
 			claims["exp"] = exp
 		}
 		return mintTestJWT(t, priv, claims)
 	}
+	// The context bindRequestPlaceholders gives the handler for this request.
+	ctx := context.WithValue(context.Background(), routeKeyContextKey{}, "PUT /v1/users/{id}")
+	ctx = context.WithValue(ctx, bindingContextKey{}, entitlements.Binding{"id": "u1"})
 
 	for _, tc := range []struct {
 		name     string
@@ -765,9 +787,12 @@ func TestBearerExp(t *testing.T) {
 		{"exp 0", mint(0, true), false},
 		{"expired", mint(time.Now().Add(-time.Hour).Unix(), true), false},
 	} {
-		_, err := s.HandleBearer(context.Background(), "op", api.Bearer{Token: tc.token})
+		_, err := s.HandleBearer(ctx, "op", api.Bearer{Token: tc.token})
 		if got := err == nil; got != tc.accepted {
 			t.Errorf("%s: accepted=%v, want %v (err: %v)", tc.name, got, tc.accepted, err)
+		}
+		if errors.Is(err, ogenerrors.ErrSkipServerSecurity) {
+			t.Errorf("%s: an invalid token was skipped, not refused", tc.name)
 		}
 	}
 }
@@ -795,8 +820,6 @@ func TestGenerate_BearerBindsRequirementPlaceholders(t *testing.T) {
 	probe := `package main
 
 import (
-	"fmt"
-	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -806,26 +829,7 @@ import (
 
 func TestBearerPlaceholders(t *testing.T) {
 	priv := startTestJWKS(t)
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	t.Setenv("PORT", fmt.Sprint(port))
-	go main()
-	base := fmt.Sprintf("http://127.0.0.1:%d", port)
-	for deadline := time.Now().Add(10 * time.Second); ; {
-		if c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
-			_ = c.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("function did not start listening")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	base := startFunction(t)
 
 	mint := func(ents ...string) string {
 		return mintTestJWT(t, priv, jwt.MapClaims{
@@ -872,23 +876,7 @@ func TestBearerPlaceholders(t *testing.T) {
 		if tc.header != "" {
 			req.Header.Set("X-Store-Id", tc.header)
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("%s: %v", tc.name, err)
-		}
-		_ = resp.Body.Close()
-		// Admitted means the request reached the generated stub, which
-		// answers 500 (not implemented); refused is ogen's 401. Anything else
-		// -- a 404 from a routing miss, a 400 -- is neither, so it must not
-		// count as a pass for either side.
-		want := http.StatusUnauthorized
-		if tc.admitted {
-			want = http.StatusInternalServerError
-		}
-		if resp.StatusCode != want {
-			t.Errorf("%s: %s %s with %v: status %d, want %d (admitted=%v)",
-				tc.name, tc.method, tc.path, tc.ents, resp.StatusCode, want, tc.admitted)
-		}
+		assertAdmitted(t, req, tc.admitted, "%s: %s %s with %v", tc.name, tc.method, tc.path, tc.ents)
 	}
 }
 `
@@ -899,63 +887,194 @@ func TestBearerPlaceholders(t *testing.T) {
 	assert.NoError(t, err, string(out))
 }
 
-// TestGenerate_OAuth2ReadsEntitlements is kdex-tech/fngogen#18: the generated
-// oauth2 handler must take the caller's entitlements from the claim the host
-// gate authorizes on, `entitlements`. It read `scopes`, which no host-minted
-// token carries, so every oauth2-only operation refused every caller. `scope`
-// must not stand in either: it is what the client asked for (a
-// client_credentials grant's scope is not filtered), which is why the host
-// gate keeps scope bucketing off.
-func TestGenerate_OAuth2ReadsEntitlements(t *testing.T) {
-	generateFixture(t, "t26", "../../test-fixtures/openapi-spec-oauth2.json")
+// TestGenerate_BearerAlternativesStaySeparate is kdex-tech/fngogen#18: each
+// security alternative is its own OR branch. ogen merges same-scheme
+// alternatives into one AND list (a, b and c), so the generated security
+// authorizes from its own table instead, against the FAT's entitlements. The
+// probe runs the generated main() and drives it over HTTP; admitted is the
+// stub's 500, refused is ogen's 401.
+func TestGenerate_BearerAlternativesStaySeparate(t *testing.T) {
+	generateFixture(t, "t26", "../../test-fixtures/openapi-spec-bearer-alternatives.json")
+
+	writeJWTProbeHelpers(t)
+	probe := `package main
+
+import (
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestBearerAlternatives(t *testing.T) {
+	priv := startTestJWKS(t)
+	base := startFunction(t)
+	exp := time.Now().Add(time.Hour).Unix()
+	withEnts := func(ents any) string {
+		return mintTestJWT(t, priv, jwt.MapClaims{"entitlements": ents, "exp": exp})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		token    string
+		admitted bool
+	}{
+		{"first alternative", withEnts([]string{"a"}), true},
+		{"second alternative", withEnts([]string{"b", "c"}), true},
+		{"part of the second alternative", withEnts([]string{"b"}), false},
+		{"no entitlements", withEnts([]string{}), false},
+		{"space-separated string", withEnts("b c"), true},
+		{"no entitlements claim", mintTestJWT(t, priv, jwt.MapClaims{"exp": exp}), false},
+	} {
+		req, err := http.NewRequest("PUT", base+"/v1/users/u1", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+tc.token)
+		assertAdmitted(t, req, tc.admitted, "%s", tc.name)
+	}
+}
+`
+	if err := os.WriteFile("cmd/bearer_alternatives_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+		return
+	}
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestBearerAlternatives", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
+}
+
+// TestGenerate_OptionalAuthFallsThrough is kdex-tech/fngogen#18: on an
+// operation that also declares an empty alternative ({}), a token that
+// satisfies no other alternative is skipped and the call proceeds as anonymous,
+// as it would with no token at all. A token that fails verification is still
+// refused. An alternative whose requirement cannot be satisfied does not stop
+// the next one from admitting.
+func TestGenerate_OptionalAuthFallsThrough(t *testing.T) {
+	generateFixture(t, "t27", "../../test-fixtures/openapi-spec-optional-auth.json")
+
+	writeJWTProbeHelpers(t)
+	probe := `package main
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestOptionalAuth(t *testing.T) {
+	priv := startTestJWKS(t)
+	base := startFunction(t)
+	exp := time.Now().Add(time.Hour).Unix()
+	withEnts := func(ents ...string) string {
+		return mintTestJWT(t, priv, jwt.MapClaims{"entitlements": ents, "exp": exp})
+	}
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		path     string
+		token    string
+		admitted bool
+	}{
+		{"no token", "/v1/users/u1", "", true},
+		{"token satisfying nothing", "/v1/users/u1", withEnts("x"), true},
+		{"token satisfying the alternative", "/v1/users/u1", withEnts("a"), true},
+		{"no entitlements claim", "/v1/users/u1", mintTestJWT(t, priv, jwt.MapClaims{"exp": exp}), true},
+		{"bad signature", "/v1/users/u1", mintTestJWT(t, other, jwt.MapClaims{"entitlements": []string{"a"}, "exp": exp}), false},
+		{"second alternative", "/v1/roles/analysts", withEnts("z"), true},
+		{"bound first alternative", "/v1/roles/analysts", withEnts("roles:analysts:update"), true},
+		{"no entitlements, no empty alternative", "/v1/roles/analysts", withEnts(), false},
+	} {
+		req, err := http.NewRequest("PUT", base+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.token != "" {
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+		}
+		assertAdmitted(t, req, tc.admitted, "%s: PUT %s", tc.name, tc.path)
+	}
+}
+`
+	if err := os.WriteFile("cmd/optional_auth_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+		return
+	}
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestOptionalAuth", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
+}
+
+// TestGenerate_SkipKeepsClaimsOutOfContext is kdex-tech/fngogen#18: a token
+// that satisfies no alternative is skipped with ogen's ErrSkipServerSecurity,
+// so ogen discards the handler's context and the call carries no claims; a
+// satisfying token puts its claims on the context. The probe calls HandleBearer
+// with the context bindRequestPlaceholders would give it.
+func TestGenerate_SkipKeepsClaimsOutOfContext(t *testing.T) {
+	generateFixture(t, "t28", "../../test-fixtures/openapi-spec-optional-auth.json")
 
 	writeJWTProbeHelpers(t)
 	probe := `package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	entitlements "github.com/kdex-tech/entitlements/go"
+	"github.com/ogen-go/ogen/ogenerrors"
 
 	"function/api"
 )
 
-func TestOAuth2Claim(t *testing.T) {
+func TestSkipKeepsClaims(t *testing.T) {
 	priv := startTestJWKS(t)
 	s := NewSecurity()
-	required := []string{"users:read", "users:write"}
+	call := func(route string, b entitlements.Binding, ents ...string) (context.Context, error) {
+		ctx := context.WithValue(context.Background(), routeKeyContextKey{}, route)
+		ctx = context.WithValue(ctx, bindingContextKey{}, b)
+		token := mintTestJWT(t, priv, jwt.MapClaims{"entitlements": ents, "exp": time.Now().Add(time.Hour).Unix()})
+		return s.HandleBearer(ctx, "op", api.Bearer{Token: token})
+	}
+	const users = "PUT /v1/users/{id}"
+	usersBinding := entitlements.Binding{"id": "u1"}
 
-	mint := func(claims jwt.MapClaims) string {
-		claims["exp"] = time.Now().Add(time.Hour).Unix()
-		return mintTestJWT(t, priv, claims)
+	if _, err := call(users, usersBinding, "x"); !errors.Is(err, ogenerrors.ErrSkipServerSecurity) {
+		t.Errorf("unsatisfied: err %v, want ErrSkipServerSecurity", err)
 	}
 
-	for _, tc := range []struct {
-		name     string
-		claims   jwt.MapClaims
-		accepted bool
-	}{
-		{"entitlements", jwt.MapClaims{"entitlements": required}, true},
-		{"unrelated entitlements", jwt.MapClaims{"entitlements": []string{"orders:read"}}, false},
-		{"scope only", jwt.MapClaims{"scope": "users:read users:write"}, false},
-		{"scopes only", jwt.MapClaims{"scopes": required}, false},
-		{"scope does not add to entitlements", jwt.MapClaims{
-			"entitlements": []string{"orders:read"}, "scope": "users:read users:write",
-		}, false},
-	} {
-		_, err := s.HandleOAuth2(context.Background(), "op", api.OAuth2{Token: mint(tc.claims), Scopes: required})
-		if got := err == nil; got != tc.accepted {
-			t.Errorf("%s: accepted=%v, want %v (err: %v)", tc.name, got, tc.accepted, err)
-		}
+	ctx, err := call(users, usersBinding, "a")
+	if err != nil {
+		t.Fatalf("satisfied: %v", err)
+	}
+	claims, ok := ctx.Value(UserContextKey).(jwt.MapClaims)
+	if !ok || claims["sub"] != "alice" {
+		t.Errorf("satisfied: claims %v, want sub alice", ctx.Value(UserContextKey))
+	}
+
+	// An alternative whose placeholder is unbound is not satisfied, and the
+	// next alternative still gets its turn.
+	const roles = "PUT /v1/roles/{key}"
+	if _, err := call(roles, entitlements.Binding{}, "z"); err != nil {
+		t.Errorf("unbound first alternative, second satisfied: %v", err)
+	}
+	if _, err := call(roles, entitlements.Binding{}, "roles:analysts:update"); !errors.Is(err, ogenerrors.ErrSkipServerSecurity) {
+		t.Errorf("unbound placeholder: err %v, want ErrSkipServerSecurity", err)
 	}
 }
 `
-	if err := os.WriteFile("cmd/oauth2_claim_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
+	if err := os.WriteFile("cmd/skip_claims_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
 		return
 	}
-	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestOAuth2Claim", "-count=1").CombinedOutput()
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestSkipKeepsClaims", "-count=1").CombinedOutput()
 	assert.NoError(t, err, string(out))
 }
 
@@ -964,6 +1083,8 @@ func TestOAuth2Claim(t *testing.T) {
 // serves a fresh ES256 key and points the generated NewSecurity() at it, and
 // mintTestJWT signs a token for that key whose sub, aud, iss and iat are
 // valid, so a rejection is attributable to the claims a probe adds.
+// startFunction runs the generated main() on a free port, and assertAdmitted
+// sends a request to it and checks whether security let it through.
 func writeJWTProbeHelpers(t *testing.T) {
 	t.Helper()
 	helpers := `package main
@@ -974,6 +1095,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -1018,6 +1140,50 @@ func mintTestJWT(t *testing.T, priv *ecdsa.PrivateKey, extra jwt.MapClaims) stri
 		t.Fatal(err)
 	}
 	return signed
+}
+
+// startFunction runs the generated main() on a free port and returns its base
+// URL once it accepts connections. Call startTestJWKS first.
+func startFunction(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+	t.Setenv("PORT", fmt.Sprint(l.Addr().(*net.TCPAddr).Port))
+	go main()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if c, err := net.Dial("tcp", addr); err == nil {
+			_ = c.Close()
+			return "http://" + addr
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("function did not start listening")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// assertAdmitted sends req and checks security's verdict. Admitted means the
+// request reached the generated stub, which answers 500 (not implemented);
+// refused is ogen's 401. Anything else -- a 404 from a routing miss, a 400 --
+// is neither, so it must not count as a pass for either side.
+func assertAdmitted(t *testing.T, req *http.Request, admitted bool, format string, args ...any) {
+	t.Helper()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s: %v", fmt.Sprintf(format, args...), err)
+	}
+	_ = resp.Body.Close()
+	want := http.StatusUnauthorized
+	if admitted {
+		want = http.StatusInternalServerError
+	}
+	if resp.StatusCode != want {
+		t.Errorf("%s: status %d, want %d (admitted=%v)", fmt.Sprintf(format, args...), resp.StatusCode, want, admitted)
+	}
 }
 `
 	require.NoError(t, os.WriteFile("cmd/jwt_probe_helpers_test.go", []byte(helpers), 0644))
