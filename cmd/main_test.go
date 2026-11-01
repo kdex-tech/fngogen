@@ -83,7 +83,7 @@ func Test_run(t *testing.T) {
 		{
 			name:    "with openIdConnect security",
 			openapi: `../../test-fixtures/openapi-spec-openIdConnect.json`,
-			workDir: "t21",
+			workDir: "t29",
 		},
 	}
 	for _, tt := range tests {
