@@ -107,7 +107,6 @@ type security struct {
 	audience string
 	checker entitlements.EntitlementsChecker
 	debug bool
-	defaultSecurityScheme string
 	issuer string
 	jwks *keyfunc.JWKS
 }
@@ -146,16 +145,10 @@ func NewSecurity() *security {
 
 	anonymousEntitlements := strings.Fields(os.Getenv("ANONYMOUS_ENTITLEMENTS"))
 
-	defaultSecurityScheme := os.Getenv("DEFAULT_SECURITY_SCHEME")
-	if defaultSecurityScheme == "" {
-		defaultSecurityScheme = "bearer"
-	}
-
 	return &security{
 		audience: audience,
-		checker: *entitlements.NewEntitlementsChecker(anonymousEntitlements, defaultSecurityScheme, false),
+		checker: *entitlements.NewEntitlementsChecker(anonymousEntitlements, "bearer", false),
 		debug: debug == "true",
-		defaultSecurityScheme: defaultSecurityScheme,
 		issuer: issuer,
 		jwks: jwks,
 	}

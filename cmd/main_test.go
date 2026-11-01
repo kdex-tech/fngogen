@@ -78,12 +78,13 @@ func Test_run(t *testing.T) {
 			openapi: `../../test-fixtures/openapi-spec-apikey-query.json`,
 			workDir: "t8",
 		},
-		// OpenID Connect security is not implemented yet in ogen
-		// {
-		// 	name:    "with openIdConnect security",
-		// 	openapi: `../../test-fixtures/openapi-spec-openIdConnect.json`,
-		// 	workDir: "t7",
-		// },
+		// ogen cannot generate openIdConnect, so this case only works because
+		// --prepare rewrites it to bearer first.
+		{
+			name:    "with openIdConnect security",
+			openapi: `../../test-fixtures/openapi-spec-openIdConnect.json`,
+			workDir: "t10",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1025,6 +1026,7 @@ func TestGenerate_SkipKeepsClaimsOutOfContext(t *testing.T) {
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -1069,6 +1071,37 @@ func TestSkipKeepsClaims(t *testing.T) {
 	if _, err := call(roles, entitlements.Binding{}, "roles:analysts:update"); !errors.Is(err, ogenerrors.ErrSkipServerSecurity) {
 		t.Errorf("unbound placeholder: err %v, want ErrSkipServerSecurity", err)
 	}
+
+	token := mintTestJWT(t, priv, jwt.MapClaims{"entitlements": []string{"a"}, "exp": time.Now().Add(time.Hour).Unix()})
+
+	// No route key: the request never passed through bindRequestPlaceholders.
+	// That is a configuration error, not a skip, so it can never fall through
+	// to an empty alternative.
+	ctx, err = s.HandleBearer(context.Background(), "op", api.Bearer{Token: token})
+	if err == nil || !strings.Contains(err.Error(), "is srv.Handler wrapped, not replaced?") {
+		t.Errorf("no route key: err %v, want the wrapped-not-replaced error", err)
+	}
+	if errors.Is(err, ogenerrors.ErrSkipServerSecurity) {
+		t.Errorf("no route key: err %v must not be a skip", err)
+	}
+	if ctx != nil {
+		t.Errorf("no route key: ctx %v, want nil", ctx)
+	}
+
+	// A route absent from operationRequirements has no alternative to satisfy.
+	ctx, err = call("PUT /nope", nil, "a")
+	if !errors.Is(err, ogenerrors.ErrSkipServerSecurity) {
+		t.Errorf("unknown route: err %v, want ErrSkipServerSecurity", err)
+	}
+	if ctx != nil {
+		t.Errorf("unknown route: ctx %v, want nil", ctx)
+	}
+
+	// Every skip returns a nil context, so ogen has nothing of the token's to keep.
+	ctx, err = call(users, usersBinding, "x")
+	if !errors.Is(err, ogenerrors.ErrSkipServerSecurity) || ctx != nil {
+		t.Errorf("unsatisfied: ctx %v err %v, want nil ctx and a skip", ctx, err)
+	}
 }
 `
 	if err := os.WriteFile("cmd/skip_claims_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
@@ -1076,6 +1109,88 @@ func TestSkipKeepsClaims(t *testing.T) {
 	}
 	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestSkipKeepsClaims", "-count=1").CombinedOutput()
 	assert.NoError(t, err, string(out))
+}
+
+// TestGenerate_NonBearerSchemesAcceptOnlyTheFAT is kdex-tech/fngogen#18: a spec
+// that declares oauth2, openIdConnect or apiKey security is served by the
+// host-minted FAT alone, whose `entitlements` are the only authority. The
+// requirement strings come from the declaration (oauth2/oidc scopes; an apiKey
+// declares none, so any valid FAT is enough), but `scope`/`scopes` claims and
+// the apiKey credential locations are never read.
+func TestGenerate_NonBearerSchemesAcceptOnlyTheFAT(t *testing.T) {
+	for i, tc := range []struct {
+		name, fixture, method string
+		need                  []string
+		apiKey                bool
+	}{
+		{"oauth2", "oauth2", "PUT", []string{"users:read", "users:write"}, false},
+		{"openIdConnect", "openIdConnect", "GET", []string{"email"}, false},
+		{"apiKey header", "apikey-header", "PUT", []string{}, true},
+		{"apiKey cookie", "apikey-cookie", "PUT", []string{}, true},
+		{"apiKey query", "apikey-query", "PUT", []string{}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			generateFixture(t, fmt.Sprintf("t%d", 30+i), "../../test-fixtures/openapi-spec-"+tc.fixture+".json")
+
+			src, err := os.ReadFile("cmd/main.go")
+			require.NoError(t, err)
+			for _, banned := range []string{"paseto", "HandleApiKey", "HandleOAuth2", "HandleOpenIdConnect"} {
+				assert.NotContains(t, strings.ToLower(string(src)), strings.ToLower(banned))
+			}
+
+			writeJWTProbeHelpers(t)
+			probe := fmt.Sprintf(`package main
+
+import (
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestNonBearer(t *testing.T) {
+	priv := startTestJWKS(t)
+	base := startFunction(t)
+	exp := time.Now().Add(time.Hour).Unix()
+	need := %#v
+	apiKey := %v
+	mint := func(extra jwt.MapClaims) string {
+		extra["exp"] = exp
+		return mintTestJWT(t, priv, extra)
+	}
+	do := func(token string, mutate func(*http.Request)) *http.Request {
+		req, err := http.NewRequest(%q, base+"/v1/users/u1", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		if mutate != nil {
+			mutate(req)
+		}
+		return req
+	}
+
+	assertAdmitted(t, do(mint(jwt.MapClaims{"entitlements": need}), nil), true, "FAT holding the declared strings")
+	if !apiKey {
+		assertAdmitted(t, do(mint(jwt.MapClaims{"entitlements": []string{"other"}}), nil), false, "FAT lacking them")
+		assertAdmitted(t, do(mint(jwt.MapClaims{"scope": strings.Join(need, " ")}), nil), false, "scope claim only")
+		assertAdmitted(t, do(mint(jwt.MapClaims{"scopes": need}), nil), false, "scopes claim only")
+	}
+
+	assertAdmitted(t, do("", func(r *http.Request) { r.Header.Set("X-API-TOKEN", "v4.public.x") }), false, "X-API-TOKEN header")
+	assertAdmitted(t, do("", func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "X-API-TOKEN", Value: "v4.public.x"}) }), false, "X-API-TOKEN cookie")
+	assertAdmitted(t, do("", func(r *http.Request) { r.URL.RawQuery = "api_token=v4.public.x" }), false, "api_token query")
+}
+`, tc.need, tc.apiKey, tc.method)
+			probe = strings.Replace(probe, "\t\"net/http\"", "\t\"net/http\"\n\t\"strings\"", 1)
+			require.NoError(t, os.WriteFile("cmd/non_bearer_probe_test.go", []byte(probe), 0644))
+			out, err := exec.Command("go", "test", "./cmd/", "-run", "TestNonBearer", "-count=1").CombinedOutput()
+			assert.NoError(t, err, string(out))
+		})
+	}
 }
 
 // writeJWTProbeHelpers writes, into the generated function's cmd package, the
