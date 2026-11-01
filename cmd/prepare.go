@@ -15,7 +15,8 @@ const rawResponseExtension = "x-ogen-raw-response"
 
 const eventStreamMediaType = "text/event-stream"
 
-// prepareSpec marks every text/event-stream response media type with
+// prepareSpec first rewrites security to bearer-only (see bearerOnlySecurity),
+// then marks every text/event-stream response media type with
 // x-ogen-raw-response: true, so a spec that declares server-sent events
 // generates a handler that can actually stream. An explicit
 // x-ogen-raw-response on the media type is left as the author set it. When
@@ -61,6 +62,8 @@ func prepareSpec(spec []byte) ([]byte, bool, error) {
 			changed = markResponses(responses) || changed
 		}
 	}
+
+	changed = bearerOnlySecurity(doc) || changed
 
 	if !changed {
 		return spec, false, nil
