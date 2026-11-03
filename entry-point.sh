@@ -58,21 +58,27 @@ fngogen --spec openapi-spec.json ${API_IMPORT_PATH:+-api-import "$API_IMPORT_PAT
 go mod tidy
 
 # Raise entitlements/go to the floor when the module resolves a lower version.
-# The version that resolves is the replacement's when a replace directive
-# applies. A replacement by a local directory has no version: it builds
-# whatever that directory holds, and `go get` would only move the require line
-# the replace overrides, so it is left alone with a warning, as is an empty
-# version. A module that isn't required at all (no security in the spec) is
-# skipped; any other failure of `go list` is surfaced. Only stdout is the
-# version: a stray stderr line mixed into it would fail the comparison and
-# trigger a `go get`, which above the floor is a downgrade. stderr is kept apart
-# to classify the failure, and passed through otherwise.
+# A module with any replace directive is left alone, with a warning naming the
+# replacement: the author who wrote the replace owns that pin, and `go get`
+# would either move the require line past a versioned left-hand side, so the
+# replace stops applying and a fork is silently dropped, or leave the replace
+# in force at its low version. An empty version is left alone too. A module
+# that isn't required at all (no security in the spec) is skipped; any other
+# failure of `go list` is surfaced. Only stdout is the listing: a stray stderr
+# line mixed into it would fail the comparison and trigger a `go get`, which
+# above the floor is a downgrade. stderr is kept apart to classify the
+# failure, and passed through otherwise. The listing is
+# "<version>|<replacement path>[@<replacement version>]".
 list_err="$(mktemp)"
-if listing="$(go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' "${ENTITLEMENTS_MODULE}" 2>"${list_err}")"; then
+if listing="$(go list -m -f '{{.Version}}|{{with .Replace}}{{.Path}}{{if .Version}}@{{.Version}}{{end}}{{end}}' "${ENTITLEMENTS_MODULE}" 2>"${list_err}")"; then
   cat "${list_err}" >&2
-  if [ -z "${listing}" ]; then
-    echo "entry-point: warning: ${ENTITLEMENTS_MODULE} resolves to a local directory or no version; not raising ${ENTITLEMENTS_MODULE} to ${ENTITLEMENTS_MIN_VERSION}" >&2
-  elif entitlements_needs_raise "${listing}" "${ENTITLEMENTS_MIN_VERSION}"; then
+  version="${listing%%|*}"
+  replacement="${listing#*|}"
+  if [ -n "${replacement}" ]; then
+    echo "entry-point: warning: ${ENTITLEMENTS_MODULE} is replaced by ${replacement}; not raising ${ENTITLEMENTS_MODULE} to ${ENTITLEMENTS_MIN_VERSION}" >&2
+  elif [ -z "${version}" ]; then
+    echo "entry-point: warning: ${ENTITLEMENTS_MODULE} resolves to no version; not raising ${ENTITLEMENTS_MODULE} to ${ENTITLEMENTS_MIN_VERSION}" >&2
+  elif entitlements_needs_raise "${version}" "${ENTITLEMENTS_MIN_VERSION}"; then
     go get "${ENTITLEMENTS_MODULE}@${ENTITLEMENTS_MIN_VERSION}"
     go mod tidy
   fi

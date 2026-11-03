@@ -746,6 +746,27 @@ func TestEntryPoint_SkipsRaiseForLocalReplace(t *testing.T) {
 	assert.Contains(t, log, "not raising "+entitlementsModule)
 }
 
+// TestEntryPoint_SkipsRaiseForVersionedReplace: a replace that names a
+// version below the floor is the author's pin too. `go get` would move the
+// require line past the replace's left-hand version, so the replace stops
+// applying and a fork in its place is silently dropped (with no left-hand
+// version, it would instead leave the low version in force). entry-point.sh
+// leaves the module alone and names the replacement.
+func TestEntryPoint_SkipsRaiseForVersionedReplace(t *testing.T) {
+	root := newEntryPointModule(t, "v0.6.0")
+	if out, err := inDir(root, "go", "mod", "edit", "-replace", entitlementsModule+"@v0.6.0="+entitlementsModule+"@v0.6.0").CombinedOutput(); err != nil {
+		t.Fatalf("go mod edit -replace: %v\n%s", err, out)
+	}
+
+	log := runEntryPoint(t, root, "../test-fixtures/openapi-spec-bearer.json")
+	assert.Equal(t, "v0.6.0", entitlementsVersion(t, root), "the require line must not move")
+	out, err := inDir(root, "go", "list", "-m", "-f", "{{with .Replace}}{{.Path}}@{{.Version}}{{end}}", entitlementsModule).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, entitlementsModule+"@v0.6.0", strings.TrimSpace(string(out)), "the replace must still apply")
+	assert.Contains(t, log, "replaced by "+entitlementsModule+"@v0.6.0")
+	assert.Contains(t, log, "not raising "+entitlementsModule)
+}
+
 // TestEntitlementsNeedsRaise drives the floor comparison in entry-point.sh.
 // Pre-releases and pseudo-versions of the floor rank below it in semver, though
 // sort -V ranks them above.
