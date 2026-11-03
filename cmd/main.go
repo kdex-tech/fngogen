@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	_ "embed"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -124,8 +123,8 @@ func run(args []string) error {
 		return err
 	}
 
-	var spec map[string]interface{}
-	if err := json.Unmarshal(content, &spec); err != nil {
+	spec, err := decodeSpec(content)
+	if err != nil {
 		return err
 	}
 

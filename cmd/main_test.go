@@ -1,12 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/scanner"
 	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -572,11 +575,7 @@ func TestSSE(t *testing.T) {
 	t.Fatal("no event received")
 }
 `
-	if err := os.WriteFile("cmd/sse_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
-		return
-	}
-	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestSSE", "-count=1").CombinedOutput()
-	assert.NoError(t, err, string(out))
+	runProbe(t, "sse", probe)
 }
 
 // TestGenerate_NoSSEOmitsRawHandler guards #9's backward compatibility: a spec
@@ -598,6 +597,18 @@ func TestGenerate_NoSSEOmitsRawHandler(t *testing.T) {
 // the zero value of whatever the result type is.
 func TestGenerate_ValueTypeResultBuilds(t *testing.T) {
 	generateFixture(t, "t17", "../../test-fixtures/openapi-spec-binary.json")
+
+	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
+		return
+	}
+}
+
+// TestGenerate_LargeNumbersBuild: a spec --prepare re-encodes keeps int64's
+// bounds exact, so ogen accepts them and the function builds. Rounded through
+// float64, the maximum became 9223372036854776000 and ogen failed with "value
+// out of range". See TestPrepareSpec_KeepsLargeNumbersExact.
+func TestGenerate_LargeNumbersBuild(t *testing.T) {
+	generateFixture(t, "t40", "../../test-fixtures/openapi-spec-large-numbers.json")
 
 	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); !assert.NoError(t, err, string(out)) {
 		return
@@ -715,6 +726,26 @@ func TestEntryPoint_KeepsEntitlementsAtFloor(t *testing.T) {
 	assert.Equal(t, "v0.7.0", entitlementsVersion(t, root))
 }
 
+// TestEntryPoint_SkipsRaiseForLocalReplace: a module that replaces
+// entitlements with a local directory builds whatever that directory holds, so
+// no version is there to compare and `go get` would only move the require line
+// the replace overrides. entry-point.sh leaves the module alone and says so.
+func TestEntryPoint_SkipsRaiseForLocalReplace(t *testing.T) {
+	root := newEntryPointModule(t, "v0.6.0")
+	// A real v0.7.0 tree, so the generated code builds against the replacement.
+	out, err := inDir(root, "go", "mod", "download", "-json", entitlementsModule+"@v0.7.0").Output()
+	require.NoError(t, err, string(out))
+	var dl struct{ Dir string }
+	require.NoError(t, json.Unmarshal(out, &dl))
+	if out, err := inDir(root, "go", "mod", "edit", "-replace", entitlementsModule+"="+dl.Dir).CombinedOutput(); err != nil {
+		t.Fatalf("go mod edit -replace: %v\n%s", err, out)
+	}
+
+	log := runEntryPoint(t, root, "../test-fixtures/openapi-spec-bearer.json")
+	assert.Equal(t, "v0.6.0", entitlementsVersion(t, root), "the require line must not move")
+	assert.Contains(t, log, "not raising "+entitlementsModule)
+}
+
 // TestEntitlementsNeedsRaise drives the floor comparison in entry-point.sh.
 // Pre-releases and pseudo-versions of the floor rank below it in semver, though
 // sort -V ranks them above.
@@ -774,8 +805,9 @@ func newEntryPointModule(t *testing.T, entitlementsPin string) string {
 
 // runEntryPoint drives entry-point.sh the way #11's caller does: TARGET_DIR is
 // a subdirectory of the module at root and API_IMPORT_PATH names its ogen
-// package. fngogen is built into a temp bin dir placed on PATH.
-func runEntryPoint(t *testing.T, root, specPath string) {
+// package. fngogen is built into a temp bin dir placed on PATH. It returns the
+// script's combined output.
+func runEntryPoint(t *testing.T, root, specPath string) string {
 	t.Helper()
 	bin := t.TempDir()
 	build := exec.Command("go", "build", "-o", filepath.Join(bin, "fngogen"), ".")
@@ -793,9 +825,11 @@ func runEntryPoint(t *testing.T, root, specPath string) {
 		"API_IMPORT_PATH=example.com/svc/head/api",
 		"FUNCTION_API_SPEC="+string(spec),
 	)
-	if out, err := ep.CombinedOutput(); err != nil {
+	out, err := ep.CombinedOutput()
+	if err != nil {
 		t.Fatalf("entry-point.sh: %v\n%s", err, out)
 	}
+	return string(out)
 }
 
 func mustAbs(t *testing.T, p string) string {
@@ -867,11 +901,7 @@ func TestBearerExp(t *testing.T) {
 	}
 }
 `
-	if err := os.WriteFile("cmd/bearer_exp_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
-		return
-	}
-	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestBearerExp", "-count=1").CombinedOutput()
-	assert.NoError(t, err, string(out))
+	runProbe(t, "bearer_exp", probe)
 }
 
 // TestGenerate_BearerBindsRequirementPlaceholders is kdex-tech/fngogen#15: the
@@ -950,11 +980,7 @@ func TestBearerPlaceholders(t *testing.T) {
 	}
 }
 `
-	if err := os.WriteFile("cmd/bearer_placeholder_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
-		return
-	}
-	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestBearerPlaceholders", "-count=1").CombinedOutput()
-	assert.NoError(t, err, string(out))
+	runProbe(t, "bearer_placeholder", probe)
 }
 
 // TestGenerate_BearerAlternativesStaySeparate is kdex-tech/fngogen#18: each
@@ -994,7 +1020,13 @@ func TestBearerAlternatives(t *testing.T) {
 		{"second alternative", withEnts([]string{"b", "c"}), true},
 		{"part of the second alternative", withEnts([]string{"b"}), false},
 		{"no entitlements", withEnts([]string{}), false},
-		{"space-separated string", withEnts("b c"), true},
+		// The claim parses as the host gate's parseToStringArray reads it: a
+		// string is ONE entitlement, trimmed, never split on whitespace.
+		{"string", withEnts("a"), true},
+		{"padded string", withEnts(" a "), true},
+		{"whitespace-joined string is one value", withEnts("b c"), false},
+		{"blank string", withEnts("  "), false},
+		{"padded element", withEnts([]string{" a "}), true},
 		{"no entitlements claim", mintTestJWT(t, priv, jwt.MapClaims{"exp": exp}), false},
 		// A nil slice marshals as JSON null, as a host-minted FAT for a subject
 		// with no grants can carry; it is an empty list, like a missing claim.
@@ -1009,24 +1041,36 @@ func TestBearerAlternatives(t *testing.T) {
 	}
 }
 `
-	if err := os.WriteFile("cmd/bearer_alternatives_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
-		return
-	}
-	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestBearerAlternatives", "-count=1").CombinedOutput()
-	assert.NoError(t, err, string(out))
+	runProbe(t, "bearer_alternatives", probe)
 }
 
-// TestGenerate_OptionalAuthFallsThrough is kdex-tech/fngogen#18: on an
-// operation that also declares an empty alternative ({}), a token that
-// satisfies no other alternative is skipped and the call proceeds as anonymous,
-// as it would with no token at all. A token that fails verification is still
-// refused. An alternative whose requirement cannot be satisfied does not stop
-// the next one from admitting.
-func TestGenerate_OptionalAuthFallsThrough(t *testing.T) {
+// TestGenerate_OptionalAuth is kdex-tech/fngogen#18. Both probes run against
+// one generation of the optional-auth fixture.
+//
+// Falling through: on an operation that also declares an empty alternative
+// ({}), a token that satisfies no other alternative is skipped and the call
+// proceeds as anonymous, as it would with no token at all. A token that fails
+// verification is still refused. An alternative whose requirement cannot be
+// satisfied does not stop the next one from admitting.
+//
+// Claims out of context: a token that satisfies no alternative is skipped with
+// ogen's ErrSkipServerSecurity, so ogen discards the handler's context and the
+// call carries no claims; a satisfying token puts its claims on the context.
+// That probe calls HandleBearer with the context bindRequestPlaceholders would
+// give it.
+func TestGenerate_OptionalAuth(t *testing.T) {
 	generateFixture(t, "t27", "../../test-fixtures/openapi-spec-optional-auth.json")
-
 	writeJWTProbeHelpers(t)
-	probe := `package main
+
+	t.Run("falls through", func(t *testing.T) {
+		runProbe(t, "optional_auth", optionalAuthProbe)
+	})
+	t.Run("skip keeps claims out of context", func(t *testing.T) {
+		runProbe(t, "skip_claims", skipKeepsClaimsProbe)
+	})
+}
+
+const optionalAuthProbe = `package main
 
 import (
 	"crypto/ecdsa"
@@ -1063,6 +1107,12 @@ func TestOptionalAuth(t *testing.T) {
 		{"no entitlements claim", "/v1/users/u1", mintTestJWT(t, priv, jwt.MapClaims{"exp": exp}), true},
 		{"null entitlements claim", "/v1/users/u1", mintTestJWT(t, priv, jwt.MapClaims{"entitlements": nil, "exp": exp}), true},
 		{"bad signature", "/v1/users/u1", mintTestJWT(t, other, jwt.MapClaims{"entitlements": []string{"a"}, "exp": exp}), false},
+		// A malformed claim is an invalid token, refused outright: skipped, it
+		// would fall through to the empty alternative.
+		{"non-string element", "/v1/users/u1", mintTestJWT(t, priv, jwt.MapClaims{"entitlements": []any{"a", 1}, "exp": exp}), false},
+		{"number claim", "/v1/users/u1", mintTestJWT(t, priv, jwt.MapClaims{"entitlements": 1, "exp": exp}), false},
+		{"object claim", "/v1/users/u1", mintTestJWT(t, priv, jwt.MapClaims{"entitlements": map[string]any{"a": true}, "exp": exp}), false},
+		{"bool claim", "/v1/users/u1", mintTestJWT(t, priv, jwt.MapClaims{"entitlements": true, "exp": exp}), false},
 		{"second alternative", "/v1/roles/analysts", withEnts("z"), true},
 		{"bound first alternative", "/v1/roles/analysts", withEnts("roles:analysts:update"), true},
 		{"no entitlements, no empty alternative", "/v1/roles/analysts", withEnts(), false},
@@ -1078,23 +1128,8 @@ func TestOptionalAuth(t *testing.T) {
 	}
 }
 `
-	if err := os.WriteFile("cmd/optional_auth_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
-		return
-	}
-	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestOptionalAuth", "-count=1").CombinedOutput()
-	assert.NoError(t, err, string(out))
-}
 
-// TestGenerate_SkipKeepsClaimsOutOfContext is kdex-tech/fngogen#18: a token
-// that satisfies no alternative is skipped with ogen's ErrSkipServerSecurity,
-// so ogen discards the handler's context and the call carries no claims; a
-// satisfying token puts its claims on the context. The probe calls HandleBearer
-// with the context bindRequestPlaceholders would give it.
-func TestGenerate_SkipKeepsClaimsOutOfContext(t *testing.T) {
-	generateFixture(t, "t28", "../../test-fixtures/openapi-spec-optional-auth.json")
-
-	writeJWTProbeHelpers(t)
-	probe := `package main
+const skipKeepsClaimsProbe = `package main
 
 import (
 	"bytes"
@@ -1189,12 +1224,6 @@ func TestSkipKeepsClaims(t *testing.T) {
 	}
 }
 `
-	if err := os.WriteFile("cmd/skip_claims_probe_test.go", []byte(probe), 0644); !assert.NoError(t, err) {
-		return
-	}
-	out, err := exec.Command("go", "test", "./cmd/", "-run", "TestSkipKeepsClaims", "-count=1").CombinedOutput()
-	assert.NoError(t, err, string(out))
-}
 
 // TestGenerate_NonBearerSchemesAcceptOnlyTheFAT is kdex-tech/fngogen#18: a spec
 // that declares oauth2, openIdConnect or apiKey security is served by the
@@ -1219,8 +1248,10 @@ func TestGenerate_NonBearerSchemesAcceptOnlyTheFAT(t *testing.T) {
 
 			src, err := os.ReadFile("cmd/main.go")
 			require.NoError(t, err)
+			// Code only: a comment may name what the function no longer does.
+			code := strings.ToLower(withoutComments(t, src))
 			for _, banned := range []string{"paseto", "HandleApiKey", "HandleOAuth2", "HandleOpenIdConnect"} {
-				assert.NotContains(t, strings.ToLower(string(src)), strings.ToLower(banned))
+				assert.NotContains(t, code, strings.ToLower(banned))
 			}
 
 			writeJWTProbeHelpers(t)
@@ -1271,11 +1302,55 @@ func TestNonBearer(t *testing.T) {
 	assertAdmitted(t, do("", func(r *http.Request) { r.URL.RawQuery = "api_token=v4.public.x" }), false, "api_token query")
 }
 `, tc.need, tc.apiKey, tc.method)
-			require.NoError(t, os.WriteFile("cmd/non_bearer_probe_test.go", []byte(probe), 0644))
-			out, err := exec.Command("go", "test", "./cmd/", "-run", "TestNonBearer", "-count=1").CombinedOutput()
-			assert.NoError(t, err, string(out))
+			runProbe(t, "non_bearer", probe)
 		})
 	}
+}
+
+// withoutComments returns the Go source src as its tokens, space-separated,
+// with every comment dropped; string literals are kept whole.
+func withoutComments(t *testing.T, src []byte) string {
+	t.Helper()
+	fset := token.NewFileSet()
+	var s scanner.Scanner
+	s.Init(fset.AddFile("main.go", -1, len(src)), src, func(pos token.Position, msg string) {
+		t.Fatalf("scan %s: %s", pos, msg)
+	}, 0)
+	var b strings.Builder
+	for {
+		_, tok, lit := s.Scan()
+		if tok == token.EOF {
+			return b.String()
+		}
+		if lit == "" {
+			lit = tok.String()
+		}
+		b.WriteString(lit)
+		b.WriteByte(' ')
+	}
+}
+
+func TestWithoutComments(t *testing.T) {
+	got := withoutComments(t, []byte("package main\n\n// no paseto here\nvar x = \"// kept\" /* gone */\n"))
+	assert.NotContains(t, got, "paseto")
+	assert.NotContains(t, got, "gone")
+	assert.Contains(t, got, `"// kept"`)
+}
+
+// probeTestName matches the declaration of a probe's test function.
+var probeTestName = regexp.MustCompile(`(?m)^func (Test\w+)\(t \*testing\.T\)`)
+
+// runProbe writes src, a test in the generated function's cmd package, to
+// cmd/<name>_probe_test.go under the fixture generateFixture left the process
+// in, and runs the one test it declares there. Anchoring -run on that name
+// keeps a renamed probe from passing as "no tests to run".
+func runProbe(t *testing.T, name, src string) {
+	t.Helper()
+	tests := probeTestName.FindAllStringSubmatch(src, -1)
+	require.Len(t, tests, 1, "a probe declares exactly one test")
+	require.NoError(t, os.WriteFile("cmd/"+name+"_probe_test.go", []byte(src), 0644))
+	out, err := exec.Command("go", "test", "./cmd/", "-run", "^"+tests[0][1]+"$", "-count=1").CombinedOutput()
+	assert.NoError(t, err, string(out))
 }
 
 // writeJWTProbeHelpers writes, into the generated function's cmd package, the

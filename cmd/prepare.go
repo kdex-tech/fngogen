@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"mime"
 	"os"
 	"strings"
@@ -15,13 +19,15 @@ const rawResponseExtension = "x-ogen-raw-response"
 
 const eventStreamMediaType = "text/event-stream"
 
-// prepareSpec first rewrites security to bearer-only (see bearerOnlySecurity),
-// then marks every text/event-stream response media type with
+// prepareSpec first marks every text/event-stream response media type with
 // x-ogen-raw-response: true, so a spec that declares server-sent events
-// generates a handler that can actually stream. An explicit
-// x-ogen-raw-response on the media type is left as the author set it. When
-// nothing needed marking, the input is returned unchanged (byte-for-byte), so
-// the step is invisible to every function that does not stream.
+// generates a handler that can actually stream, then rewrites security to
+// bearer-only (see bearerOnlySecurity). An explicit x-ogen-raw-response on the
+// media type is left as the author set it. When nothing needed marking or
+// rewriting, the input is returned unchanged (byte-for-byte), so the step is
+// invisible to every function that neither streams nor declares a non-bearer
+// scheme. Each scopelessNonBearerWarnings line is written to warnings, prefixed
+// "warning: ", once the spec is prepared.
 //
 // WORKAROUND for ogen, which runs at @latest (v1.24.0 as of 2026-10-01):
 //   - a typed text/event-stream response fails server generation with
@@ -33,9 +39,9 @@ const eventStreamMediaType = "text/event-stream"
 //
 // Delete this step once ogen ships typed SSE server encoding (#1742) whose
 // encoder flushes per event. See kdex-tech/fngogen#9.
-func prepareSpec(spec []byte) ([]byte, bool, error) {
-	var doc map[string]any
-	if err := json.Unmarshal(spec, &doc); err != nil {
+func prepareSpec(spec []byte, warnings io.Writer) ([]byte, bool, error) {
+	doc, err := decodeSpec(spec)
+	if err != nil {
 		return nil, false, err
 	}
 
@@ -63,11 +69,19 @@ func prepareSpec(spec []byte) ([]byte, bool, error) {
 		}
 	}
 
+	// Before the rewrite, which erases the scheme names the warnings read.
+	warned, err := scopelessNonBearerWarnings(doc)
+	if err != nil {
+		return nil, false, err
+	}
 	secChanged, err := bearerOnlySecurity(doc)
 	if err != nil {
 		return nil, false, err
 	}
 	changed = secChanged || changed
+	for _, w := range warned {
+		_, _ = fmt.Fprintf(warnings, "warning: %s\n", w)
+	}
 
 	if !changed {
 		return spec, false, nil
@@ -77,6 +91,25 @@ func prepareSpec(spec []byte) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	return out, true, nil
+}
+
+// decodeSpec decodes an OpenAPI document for rewriting or reading, keeping
+// every number as its json.Number literal. Decoded as float64, a number above
+// 2^53 is rounded and re-encodes changed: int64's maximum comes back as
+// 9223372036854776000, which ogen rejects as out of range, and a large enum
+// value silently becomes another. Like json.Unmarshal, it rejects trailing
+// data after the document.
+func decodeSpec(spec []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(spec))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid JSON: data after the top-level value")
+	}
+	return doc, nil
 }
 
 // markResponses marks the event-stream media types of every response in a
@@ -123,7 +156,7 @@ func prepareSpecFile(path string) error {
 	if err != nil {
 		return err
 	}
-	out, changed, err := prepareSpec(spec)
+	out, changed, err := prepareSpec(spec, os.Stderr)
 	if err != nil || !changed {
 		return err
 	}

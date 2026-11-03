@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -21,7 +23,8 @@ const bearerSchemeName = "bearer"
 // components.securitySchemes becomes exactly the canonical bearer scheme. It
 // reports whether doc changed; a spec already in canonical form, or with no
 // security at all, reports false. A malformed security value is an error (see
-// securityOf), and doc must then be discarded: it may be partly rewritten.
+// securityOf), as is a path item it cannot see into (see eachOperation), and
+// doc must then be discarded: it may be partly rewritten.
 func bearerOnlySecurity(doc map[string]any) (bool, error) {
 	changed := false
 	used := false
@@ -58,20 +61,10 @@ func bearerOnlySecurity(doc map[string]any) (bool, error) {
 	if err := rewrite(doc, "top-level security"); err != nil {
 		return false, err
 	}
-	if paths, ok := doc["paths"].(map[string]any); ok {
-		for path, item := range paths {
-			pathItem, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			for _, method := range bindingMethods {
-				if operation, ok := pathItem[method].(map[string]any); ok {
-					if err := rewrite(operation, "security of "+strings.ToUpper(method)+" "+path); err != nil {
-						return false, err
-					}
-				}
-			}
-		}
+	if err := eachOperation(doc, func(key string, op map[string]any) error {
+		return rewrite(op, "security of "+key)
+	}); err != nil {
+		return false, err
 	}
 
 	if !used {
@@ -90,6 +83,92 @@ func bearerOnlySecurity(doc map[string]any) (bool, error) {
 		changed = true
 	}
 	return changed, nil
+}
+
+// eachOperation calls fn with the "METHOD /path" key of every operation in
+// doc's paths, in path then bindingMethods order, so errors and warnings come
+// out in a stable order. A path item holding operations outside the fixed
+// method fields is an error naming its shape, before fn sees any of its
+// operations: neither the security rewrite nor the requirement table can see
+// into it, so its operations would keep their declared schemes at ogen and get
+// no requirement entry. That fails closed, but only at request time and
+// without saying why. kdex-fnnodejsgen's src/parse.ts rejects the same shapes.
+func eachOperation(doc map[string]any, fn func(key string, op map[string]any) error) error {
+	paths, _ := doc["paths"].(map[string]any)
+	for _, path := range slices.Sorted(maps.Keys(paths)) {
+		item, ok := paths[path].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, ok := item["$ref"]; ok {
+			return fmt.Errorf("path %s: a path item $ref is not supported: generation cannot see the operations it points to; declare them inline", path)
+		}
+		for _, field := range []string{"query", "additionalOperations"} {
+			if _, ok := item[field]; ok {
+				return fmt.Errorf("path %s: the OpenAPI 3.2 path item field %q is not supported: generation cannot see the operations it holds", path, field)
+			}
+		}
+		for _, method := range bindingMethods {
+			if op, ok := item[method].(map[string]any); ok {
+				if err := fn(strings.ToUpper(method)+" "+path, op); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// effectiveSecurity returns the alternatives guarding the operation at key:
+// its own, else the top-level ones when it has no security key or a null one,
+// as ogen reads them.
+func effectiveSecurity(top []any, op map[string]any, key string) ([]any, error) {
+	own, present, err := securityOf(op, "security of "+key)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		return own, nil
+	}
+	return top, nil
+}
+
+// scopelessNonBearerWarnings names each operation guarded by a non-empty
+// alternative declared only under non-bearer schemes whose strings union to
+// none, such as [{"apiKeyHeader": []}]. Rewritten to {"bearer": []}, it admits
+// any valid FAT. Such specs are legal and common (knowdb's), so this is a
+// warning, not an error; but an author who declared an apiKey may have meant
+// more. A scheme counts as bearer by its name, as the rewrite emits it. It
+// must run before bearerOnlySecurity, which erases the scheme names. Its
+// counterpart in kdex-fnnodejsgen is src/parse.ts; the wording is shared.
+func scopelessNonBearerWarnings(doc map[string]any) ([]string, error) {
+	top, _, err := securityOf(doc, "top-level security")
+	if err != nil {
+		return nil, err
+	}
+	var warnings []string
+	err = eachOperation(doc, func(key string, op map[string]any) error {
+		sec, err := effectiveSecurity(top, op, key)
+		if err != nil {
+			return err
+		}
+		for _, a := range sec {
+			alt := a.(map[string]any)
+			if _, bearer := alt[bearerSchemeName]; bearer || len(alt) == 0 {
+				continue
+			}
+			union, err := unionAlternative(alt)
+			if err != nil {
+				return fmt.Errorf("security of %s: %w", key, err)
+			}
+			if len(union) == 0 {
+				warnings = append(warnings, key+`: an alternative with no requirement strings under non-bearer schemes becomes "any valid FAT" at the function`)
+				return nil
+			}
+		}
+		return nil
+	})
+	return warnings, err
 }
 
 // securityOf returns holder's security alternatives (the spec's top-level

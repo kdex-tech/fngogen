@@ -227,6 +227,11 @@ var entitlementBindings = map[string]map[string][]bindingSource{
 // ({}) has no entry. HandleBearer authorizes from this table, not from the
 // roles ogen passes it, because ogen merges same-scheme alternatives into a
 // single list that must hold in full. See kdex-tech/fngogen#18.
+//
+// WORKAROUND for ogen v1.24.0 (@latest as of 2026-11-01), whose
+// operationRoles<Scheme> is one merged list per operation and scheme
+// (ogen-go/ogen#1510, open). Delete it once an ogen release keeps the
+// alternatives apart; see operationRequirements in fngogen.
 var operationRequirements = map[string][][]string{
 {{- range $route, $alts := .OperationRequirements}}
 	{{printf "%q" $route}}: {
@@ -239,7 +244,8 @@ var operationRequirements = map[string][][]string{
 
 // missingRequirementsLogged records each route authorize found absent from
 // operationRequirements, so that defect is logged once per route, not on every
-// request.
+// request. It guards a disagreement between fngogen --prepare, which left the
+// operation secured for ogen, and the table, which recorded no alternative.
 var missingRequirementsLogged sync.Map
 
 type bindingContextKey struct{}
@@ -401,25 +407,9 @@ func (s *security) authorize(ctx context.Context, claims jwt.MapClaims) (context
 		return nil, false, fmt.Errorf("missing required claim: sub")
 	}
 
-	// A token without the claim, or with it as JSON null (a nil slice marshals
-	// so), holds no entitlements; it still satisfies an alternative that asks
-	// for none.
-	var held []string
-	if raw, present := claims["entitlements"]; present {
-		switch v := raw.(type) {
-		case nil:
-		case string:
-			held = strings.Fields(v)
-		case []any:
-			held = make([]string, 0, len(v))
-			for _, e := range v {
-				if str, ok := e.(string); ok {
-					held = append(held, strings.TrimSpace(str))
-				}
-			}
-		default:
-			return nil, false, fmt.Errorf("unknown assertion type: %T for claim: entitlements", v)
-		}
+	held, err := entitlementsClaim(claims)
+	if err != nil {
+		return nil, false, err
 	}
 
 	// Both keys are set together by bindRequestPlaceholders. A custom
@@ -458,7 +448,9 @@ func (s *security) authorize(ctx context.Context, claims jwt.MapClaims) (context
 			continue
 		}
 		if s.checker.VerifyParsedEntitlements(ent, bound) {
-			return s.mergeClaims(ctx, claims), true, nil
+			// The one satisfied alternative of the one handler: the token's
+			// claims are the caller's, with nothing to merge them into.
+			return context.WithValue(ctx, UserContextKey, claims), true, nil
 		}
 	}
 
@@ -468,20 +460,38 @@ func (s *security) authorize(ctx context.Context, claims jwt.MapClaims) (context
 	return nil, false, nil
 }
 
-func (s *security) mergeClaims(ctx context.Context, newClaims jwt.MapClaims) context.Context {
-	claims, ok := ctx.Value(UserContextKey).(jwt.MapClaims)
-	if !ok {
-		claims = jwt.MapClaims{}
-	}
-	for k, v := range newClaims {
-		if existingSlice, isSlice := claims[k].([]string); isSlice {
-			if newSlice, ok := v.([]string); ok {
-				claims[k] = append(existingSlice, newSlice...)
-				continue
-			}
+// entitlementsClaim reads the token's `entitlements` claim as the host gate's
+// parseToStringArray does (kdex-host-manager internal/auth/context.go), so the
+// function holds what the gate checked: a string is ONE entitlement, trimmed
+// and never split on whitespace, and each element of an array is trimmed. A
+// missing claim, JSON null (a nil slice marshals so) or a blank string holds
+// nothing, which still satisfies an alternative that asks for nothing. Any
+// other shape -- an array with a non-string element, a number, an object -- is
+// an invalid token: an error, refused outright, never a skip that could fall
+// through to an empty alternative. Where the gate is lenient with those, the
+// function is stricter on purpose. kdex-fnnodejsgen's src/emit/auth.ts must
+// parse the claim identically.
+func entitlementsClaim(claims jwt.MapClaims) ([]string, error) {
+	switch v := claims["entitlements"].(type) {
+	case nil:
+		return nil, nil
+	case string:
+		if e := strings.TrimSpace(v); e != "" {
+			return []string{e}, nil
 		}
-		claims[k] = v
+		return nil, nil
+	case []any:
+		held := make([]string, 0, len(v))
+		for i, e := range v {
+			str, ok := e.(string)
+			if !ok {
+				return nil, fmt.Errorf("invalid claim entitlements: element %d is %T, not a string", i, e)
+			}
+			held = append(held, strings.TrimSpace(str))
+		}
+		return held, nil
+	default:
+		return nil, fmt.Errorf("invalid claim entitlements: %T, not a string or an array of strings", v)
 	}
-	return context.WithValue(ctx, UserContextKey, claims)
 }
 {{end}}

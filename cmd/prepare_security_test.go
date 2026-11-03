@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -109,7 +111,7 @@ func TestUnionAlternative(t *testing.T) {
 
 func TestPrepareSpec_BearerOnlyCanonicalIsUnchanged(t *testing.T) {
 	spec := []byte(`{"components":{"securitySchemes":` + canonicalSchemes + `},"paths":{"/x":{"get":{"security":[{"bearer":["a"]}]}}}}`)
-	out, changed, err := prepareSpec(spec)
+	out, changed, err := prepareSpec(spec, io.Discard)
 	if err != nil || changed || string(out) != string(spec) {
 		t.Errorf("changed=%v err=%v out=%s", changed, err, out)
 	}
@@ -117,7 +119,7 @@ func TestPrepareSpec_BearerOnlyCanonicalIsUnchanged(t *testing.T) {
 
 func TestPrepareSpec_RewritesSecurity(t *testing.T) {
 	spec := []byte(`{"paths":{"/x":{"get":{"security":[{"oauth2":["a"]}]}}}}`)
-	out, changed, err := prepareSpec(spec)
+	out, changed, err := prepareSpec(spec, io.Discard)
 	if err != nil || !changed {
 		t.Fatalf("changed=%v err=%v", changed, err)
 	}
@@ -152,7 +154,7 @@ func TestBearerOnlySecurity_RejectsMalformed(t *testing.T) {
 }
 
 func TestPrepareSpec_RejectsMalformedSecurity(t *testing.T) {
-	_, _, err := prepareSpec([]byte(`{"paths":{"/x":{"get":{"security":[{"oauth2":"users:write"}]}}}}`))
+	_, _, err := prepareSpec([]byte(`{"paths":{"/x":{"get":{"security":[{"oauth2":"users:write"}]}}}}`), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "GET /x") {
 		t.Errorf("err = %v, want an error naming GET /x", err)
 	}
@@ -169,5 +171,67 @@ func TestRun_RejectsMalformedSecurity(t *testing.T) {
 	}
 	if out, _ := os.ReadFile(path); string(out) != string(spec) {
 		t.Errorf("spec rewritten: %s", out)
+	}
+}
+
+// unseenPathShapes are path items whose operations the security rewrite and
+// the requirement table cannot see, keyed by the shape the error must name.
+var unseenPathShapes = map[string]string{
+	"$ref":                 `{"$ref":"#/components/pathItems/X"}`,
+	"query":                `{"query":{"security":[{"oauth2":["a"]}]}}`,
+	"additionalOperations": `{"additionalOperations":{"PURGE":{"security":[{"oauth2":["a"]}]}}}`,
+}
+
+// TestPrepareSpec_RejectsUnseenPathShapes: a path item the rewrite cannot see
+// into would keep its declared schemes; generation must fail naming the shape.
+func TestPrepareSpec_RejectsUnseenPathShapes(t *testing.T) {
+	for shape, item := range unseenPathShapes {
+		_, _, err := prepareSpec([]byte(`{"paths":{"/x":`+item+`}}`), io.Discard)
+		if err == nil || !strings.Contains(err.Error(), shape) || !strings.Contains(err.Error(), "/x") {
+			t.Errorf("%s: err = %v, want an error naming %q and /x", shape, err, shape)
+		}
+	}
+}
+
+// TestPrepareSpec_WarnsScopelessNonBearerAlternative: an alternative declared
+// only under non-bearer schemes with no strings unions to [], which the
+// function reads as "any valid FAT". That is legal (knowdb declares such
+// specs), but rarely what an apiKey author meant, so --prepare says so per
+// operation, on stderr, without failing.
+func TestPrepareSpec_WarnsScopelessNonBearerAlternative(t *testing.T) {
+	const warning = `: an alternative with no requirement strings under non-bearer schemes becomes "any valid FAT" at the function`
+	for _, tc := range []struct {
+		name string
+		spec string
+		want []string // the METHOD PATH of each expected warning
+	}{
+		{"apiKey without strings",
+			`{"paths":{"/x":{"put":{"security":[{"apiKeyHeader":[]}]}}}}`, []string{"PUT /x"}},
+		{"two non-bearer schemes, no strings",
+			`{"paths":{"/x":{"put":{"security":[{"apiKeyHeader":[],"apiKeyQuery":[]}]}}}}`, []string{"PUT /x"}},
+		{"inherited from top-level",
+			`{"security":[{"apiKeyQuery":[]}],"paths":{"/a":{"get":{}},"/b":{"get":{"security":[]}}}}`, []string{"GET /a"}},
+		{"bearer without strings is explicit",
+			`{"paths":{"/x":{"put":{"security":[{"bearer":[]}]}}}}`, nil},
+		{"bearer alongside",
+			`{"paths":{"/x":{"put":{"security":[{"bearer":[],"apiKeyHeader":[]}]}}}}`, nil},
+		{"non-bearer with strings",
+			`{"paths":{"/x":{"put":{"security":[{"oauth2":["a"],"apiKeyHeader":[]}]}}}}`, nil},
+		{"empty alternative",
+			`{"paths":{"/x":{"put":{"security":[{}]}}}}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			if _, _, err := prepareSpec([]byte(tc.spec), &stderr); err != nil {
+				t.Fatal(err)
+			}
+			want := ""
+			for _, op := range tc.want {
+				want += "warning: " + op + warning + "\n"
+			}
+			if stderr.String() != want {
+				t.Errorf("stderr = %q, want %q", stderr.String(), want)
+			}
+		})
 	}
 }

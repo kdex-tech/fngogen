@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,7 +30,7 @@ func rawResponseAt(t *testing.T, spec []byte, mediaType string) any {
 }
 
 func TestPrepareSpec_MarksTypedSSEResponseRaw(t *testing.T) {
-	out, changed, err := prepareSpec(sseSpec(`{"schema":{"type":"object","properties":{"message":{"type":"string"}}}}`))
+	out, changed, err := prepareSpec(sseSpec(`{"schema":{"type":"object","properties":{"message":{"type":"string"}}}}`), io.Discard)
 	require.NoError(t, err)
 	assert.True(t, changed)
 	assert.Equal(t, true, rawResponseAt(t, out, "text/event-stream"))
@@ -39,7 +40,7 @@ func TestPrepareSpec_MarksTypedSSEResponseRaw(t *testing.T) {
 // without flushing, so events reach the client only when the stream ends.
 // It is marked raw too. See kdex-tech/fngogen#9.
 func TestPrepareSpec_MarksUntypedSSEResponseRaw(t *testing.T) {
-	out, changed, err := prepareSpec(sseSpec(`{"schema":{"type":"string"}}`))
+	out, changed, err := prepareSpec(sseSpec(`{"schema":{"type":"string"}}`), io.Discard)
 	require.NoError(t, err)
 	assert.True(t, changed)
 	assert.Equal(t, true, rawResponseAt(t, out, "text/event-stream"))
@@ -49,7 +50,7 @@ func TestPrepareSpec_MatchesMediaTypeWithParameters(t *testing.T) {
 	spec := []byte(`{"openapi":"3.0.3","info":{"title":"t","version":"1"},
 	"paths":{"/v1/events":{"get":{"responses":{"200":{"description":"ok",
 	"content":{"Text/Event-Stream; charset=utf-8":{"schema":{"type":"string"}}}}}}}}}`)
-	out, changed, err := prepareSpec(spec)
+	out, changed, err := prepareSpec(spec, io.Discard)
 	require.NoError(t, err)
 	assert.True(t, changed)
 	assert.Equal(t, true, rawResponseAt(t, out, "Text/Event-Stream; charset=utf-8"))
@@ -58,7 +59,7 @@ func TestPrepareSpec_MatchesMediaTypeWithParameters(t *testing.T) {
 // An author who set the extension explicitly -- either way -- keeps it.
 func TestPrepareSpec_KeepsExplicitRawResponse(t *testing.T) {
 	spec := sseSpec(`{"schema":{"type":"string"},"x-ogen-raw-response":false}`)
-	out, changed, err := prepareSpec(spec)
+	out, changed, err := prepareSpec(spec, io.Discard)
 	require.NoError(t, err)
 	assert.False(t, changed)
 	assert.Equal(t, spec, out)
@@ -70,7 +71,7 @@ func TestPrepareSpec_MarksComponentResponses(t *testing.T) {
 	spec := []byte(`{"openapi":"3.0.3","info":{"title":"t","version":"1"},
 	"paths":{"/v1/events":{"get":{"responses":{"200":{"$ref":"#/components/responses/Events"}}}}},
 	"components":{"responses":{"Events":{"description":"ok","content":{"text/event-stream":{"schema":{"type":"string"}}}}}}}`)
-	out, changed, err := prepareSpec(spec)
+	out, changed, err := prepareSpec(spec, io.Discard)
 	require.NoError(t, err)
 	assert.True(t, changed)
 
@@ -85,7 +86,7 @@ func TestPrepareSpec_LeavesRequestBodiesAlone(t *testing.T) {
 	spec := []byte(`{"openapi":"3.0.3","info":{"title":"t","version":"1"},
 	"paths":{"/v1/events":{"post":{"requestBody":{"content":{"text/event-stream":{"schema":{"type":"string"}}}},
 	"responses":{"204":{"description":"ok"}}}}}}`)
-	out, changed, err := prepareSpec(spec)
+	out, changed, err := prepareSpec(spec, io.Discard)
 	require.NoError(t, err)
 	assert.False(t, changed)
 	assert.Equal(t, spec, out)
@@ -96,7 +97,7 @@ func TestPrepareSpec_LeavesRequestBodiesAlone(t *testing.T) {
 func TestPrepareSpec_NoSSEIsUnchanged(t *testing.T) {
 	spec, err := os.ReadFile("../test-fixtures/openapi-spec.json")
 	require.NoError(t, err)
-	out, changed, err := prepareSpec(spec)
+	out, changed, err := prepareSpec(spec, io.Discard)
 	require.NoError(t, err)
 	assert.False(t, changed)
 	assert.Equal(t, spec, out)
@@ -111,4 +112,19 @@ func TestRun_PrepareRewritesSpecInPlace(t *testing.T) {
 	out, err := os.ReadFile(path)
 	require.NoError(t, err)
 	assert.Equal(t, true, rawResponseAt(t, out, "text/event-stream"))
+}
+
+// TestPrepareSpec_KeepsLargeNumbersExact: a rewrite re-encodes the spec, and a
+// number decoded as float64 comes back rounded: int64's maximum becomes
+// 9223372036854776000, which ogen rejects as out of range, and an enum value
+// silently changes. Every number must survive byte-exact.
+func TestPrepareSpec_KeepsLargeNumbersExact(t *testing.T) {
+	spec, err := os.ReadFile("../test-fixtures/openapi-spec-large-numbers.json")
+	require.NoError(t, err)
+	out, changed, err := prepareSpec(spec, io.Discard)
+	require.NoError(t, err)
+	require.True(t, changed, "the oauth2 security must be rewritten, so the spec is re-encoded")
+	for _, n := range []string{"9223372036854775807", "-9223372036854775808", "12345678901234567"} {
+		assert.Contains(t, string(out), n)
+	}
 }

@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -80,7 +82,7 @@ func TestOperationRequirements_PreparedEqualsUnprepared(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepared, _, err := prepareSpec(raw)
+	prepared, _, err := prepareSpec(raw, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,6 +125,54 @@ func TestOperationRequirements_RejectsMalformed(t *testing.T) {
 	} {
 		if got, err := operationRequirements(reqSpec(t, tc.top, tc.op)); err == nil {
 			t.Errorf("top %s op %s: no error, table %v", tc.top, tc.op, got)
+		}
+	}
+}
+
+// TestOperationRequirements_Conformance is the case list shared with
+// kdex-fnnodejsgen (src/parse.test.ts): both generators must
+// turn each declared security into the same alternatives. Where they differ by
+// design, fnnodejsgen keeps {} as a last alternative and this table drops it:
+// here ogen admits the empty alternative on its own.
+func TestOperationRequirements_Conformance(t *testing.T) {
+	for _, tc := range []struct {
+		security string
+		want     [][]string // nil: no entry, the operation has no security
+	}{
+		{`[{"oauth2":["b","a"],"apiKeyHeader":["a","c"]}]`, [][]string{{"a", "c", "b"}}},
+		{`[{"bearer":["a"]},{"bearer":["b","c"]}]`, [][]string{{"a"}, {"b", "c"}}},
+		{`[{},{"oidc":["x"]}]`, [][]string{{"x"}}},
+		{`[{"apiKeyCookie":[]}]`, [][]string{{}}},
+		{`[]`, nil},
+	} {
+		got := mustReqs(t, reqSpec(t, "", `"security":`+tc.security))
+		alts, present := got["PUT /v1/x/{id}"]
+		if tc.want == nil {
+			if present {
+				t.Errorf("%s: got %v, want no entry", tc.security, alts)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(alts, tc.want) {
+			t.Errorf("%s: got %v, want %v", tc.security, alts, tc.want)
+		}
+	}
+	// {} admits with no token: the operation's security includes it, so ogen
+	// lets the call through when the bearer handler skips.
+	if got := mustReqs(t, reqSpec(t, "", `"security":[{}]`)); len(got) != 0 {
+		t.Errorf("[{}]: got %v, want no entry", got)
+	}
+}
+
+// TestOperationRequirements_RejectsUnseenPathShapes: a path item whose
+// operations the table cannot see -- a $ref, or OpenAPI 3.2's query and
+// additionalOperations -- is a generation error naming the shape, not a
+// silently missing entry.
+func TestOperationRequirements_RejectsUnseenPathShapes(t *testing.T) {
+	for shape, item := range unseenPathShapes {
+		_, err := operationRequirements(mustDoc(t, `{"paths":{"/x":`+item+`}}`))
+		if err == nil || !strings.Contains(err.Error(), shape) || !strings.Contains(err.Error(), "/x") {
+			t.Errorf("%s: err = %v, want an error naming %q and /x", shape, err, shape)
 		}
 	}
 }
