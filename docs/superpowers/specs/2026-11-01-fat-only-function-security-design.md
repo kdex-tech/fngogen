@@ -101,7 +101,7 @@ A KDexFunction's `spec.api` may declare several security schemes on an operation
    - **On no alternative satisfied, return `ogenerrors.ErrSkipServerSecurity`.** For an op without `{}`, ogen then answers 401 exactly as before. For an op with `{}`, the request proceeds without claims.
    - An invalid token (signature, `aud`, `iss`, `exp`) stays a hard error.
 4. **Delete the other handlers.** Remove `handleApiKey`, `HandleApiKey*`, `HandleOAuth2` and `HandleOpenIdConnect`, the PASETO key fetching (`PASETO_PKS_URL`) and the token-prefix restore. Also remove the `APIKey*Security` / `OAuth2Security` / `OpenIdConnectSecurity` template flags.
-5. **Keep** `RequestTokenContextKey` / `RequestTokenFromContext` (the FAT is what `kdexauth.Exchange` forwards) and the claims merge into `UserContextKey`.
+5. **Keep** `RequestTokenContextKey` / `RequestTokenFromContext` (the FAT is what `kdexauth.Exchange` forwards) and the verified token's claims under `UserContextKey` (set directly; there is one handler per call, so nothing is merged).
 6. **This supersedes the interim fix.** The unpushed interim commit `0ddd4f8` (oauth2/oidc → `entitlements`) stops mattering once those handlers are gone. Its test `TestGenerate_OAuth2ReadsEntitlements` is reworked to assert the new behavior for an oauth2-declared fixture: an `entitlements` token is admitted, and tokens with only `scope` or `scopes` are refused.
 
 ### fnnodejsgen
