@@ -720,9 +720,13 @@ func TestEntryPoint_KeepsEntitlementsAtFloor(t *testing.T) {
 // sort -V ranks them above.
 func TestEntitlementsNeedsRaise(t *testing.T) {
 	cases := map[string]bool{
-		"v0.6.0": true, "v0.7.0": false, "v0.7.0-rc.1": true,
+		"v0.6.0":                               true,
+		"v0.6.9":                               true,
+		"v0.7.0":                               false,
+		"v0.7.0-rc.1":                          true,
 		"v0.7.0-0.20261101000000-abcdef123456": true,
-		"v0.7.1": false, "v0.10.0": false, "v0.6.9": true,
+		"v0.7.1":                               false,
+		"v0.10.0":                              false,
 	}
 	script := mustAbs(t, "../entry-point.sh")
 	for version, want := range cases {
@@ -1093,8 +1097,11 @@ func TestGenerate_SkipKeepsClaimsOutOfContext(t *testing.T) {
 	probe := `package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1158,12 +1165,21 @@ func TestSkipKeepsClaims(t *testing.T) {
 	}
 
 	// A route absent from operationRequirements has no alternative to satisfy.
+	// That can only be a generator or configuration defect, so it is logged
+	// outside debug, once per route however often it recurs.
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
 	ctx, err = call("PUT /nope", nil, "a")
 	if !errors.Is(err, ogenerrors.ErrSkipServerSecurity) {
 		t.Errorf("unknown route: err %v, want ErrSkipServerSecurity", err)
 	}
 	if ctx != nil {
 		t.Errorf("unknown route: ctx %v, want nil", ctx)
+	}
+	_, _ = call("PUT /nope", nil, "a")
+	if n := strings.Count(logs.String(), "PUT /nope"); n != 1 {
+		t.Errorf("unknown route: logged %d times, want once: %q", n, logs.String())
 	}
 
 	// Every skip returns a nil context, so ogen has nothing of the token's to keep.

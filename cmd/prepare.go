@@ -63,7 +63,11 @@ func prepareSpec(spec []byte) ([]byte, bool, error) {
 		}
 	}
 
-	changed = bearerOnlySecurity(doc) || changed
+	secChanged, err := bearerOnlySecurity(doc)
+	if err != nil {
+		return nil, false, err
+	}
+	changed = secChanged || changed
 
 	if !changed {
 		return spec, false, nil

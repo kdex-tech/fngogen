@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -41,8 +44,8 @@ func TestBearerOnlySecurity(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := mustDoc(t, tt.in)
-			if !bearerOnlySecurity(doc) {
-				t.Fatal("expected changed")
+			if changed, err := bearerOnlySecurity(doc); err != nil || !changed {
+				t.Fatalf("changed=%v err=%v", changed, err)
 			}
 			got := doc["paths"].(map[string]any)["/x"].(map[string]any)["put"].(map[string]any)["security"]
 			if !reflect.DeepEqual(got, mustDoc(t, `{"s":`+tt.want+`}`)["s"]) {
@@ -60,8 +63,8 @@ func TestBearerOnlySecurity_TopLevelAndOperations(t *testing.T) {
 	doc := mustDoc(t, `{"security":[{"oauth2":["a"]}],"paths":{
 		"/x":{"parameters":[{"name":"p"}],"x-kdex-metadata":{"k":1},
 			"get":{"security":[]},"put":{}}}}`)
-	if !bearerOnlySecurity(doc) {
-		t.Fatal("expected changed")
+	if changed, err := bearerOnlySecurity(doc); err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
 	}
 	if !reflect.DeepEqual(doc["security"], mustDoc(t, `{"s":[{"bearer":["a"]}]}`)["s"]) {
 		t.Errorf("top-level security = %v", doc["security"])
@@ -82,8 +85,8 @@ func TestBearerOnlySecurity_TopLevelAndOperations(t *testing.T) {
 func TestBearerOnlySecurity_NoSecurityUntouched(t *testing.T) {
 	in := `{"paths":{"/x":{"get":{"responses":{}}}}}`
 	doc := mustDoc(t, in)
-	if bearerOnlySecurity(doc) {
-		t.Error("changed = true for a spec with no security")
+	if changed, err := bearerOnlySecurity(doc); err != nil || changed {
+		t.Errorf("changed=%v err=%v for a spec with no security", changed, err)
 	}
 	if !reflect.DeepEqual(doc, mustDoc(t, in)) {
 		t.Error("doc was mutated")
@@ -93,14 +96,14 @@ func TestBearerOnlySecurity_NoSecurityUntouched(t *testing.T) {
 func TestBearerOnlySecurity_AlreadyCanonical(t *testing.T) {
 	doc := mustDoc(t, `{"components":{"securitySchemes":`+canonicalSchemes+`},
 		"paths":{"/x":{"get":{"security":[{"bearer":["a"]},{}]}}}}`)
-	if bearerOnlySecurity(doc) {
-		t.Error("changed = true for a canonical spec")
+	if changed, err := bearerOnlySecurity(doc); err != nil || changed {
+		t.Errorf("changed=%v err=%v for a canonical spec", changed, err)
 	}
 }
 
 func TestUnionAlternative(t *testing.T) {
-	if got := unionAlternative(map[string]any{"a": []any{}}); got == nil || len(got) != 0 {
-		t.Errorf("got %#v, want empty non-nil", got)
+	if got, err := unionAlternative(map[string]any{"a": []any{}}); err != nil || got == nil || len(got) != 0 {
+		t.Errorf("got %#v err %v, want empty non-nil", got, err)
 	}
 }
 
@@ -121,5 +124,50 @@ func TestPrepareSpec_RewritesSecurity(t *testing.T) {
 	doc := mustDoc(t, string(out))
 	if _, ok := doc["components"].(map[string]any)["securitySchemes"].(map[string]any)["bearer"]; !ok {
 		t.Errorf("no bearer scheme: %s", out)
+	}
+}
+
+// TestBearerOnlySecurity_RejectsMalformed: a security value ogen would reject
+// must fail preparation. Read leniently, `{"oauth2": "users:write"}` became
+// {"bearer": []}, which any valid token satisfies (fail open).
+func TestBearerOnlySecurity_RejectsMalformed(t *testing.T) {
+	for name, sec := range map[string]string{
+		"scheme value not an array": `[{"oauth2":"users:write"}]`,
+		"non-string scope":          `[{"oauth2":[123]}]`,
+		"null scheme value":         `[{"oauth2":null}]`,
+		"alternative not an object": `["bearer"]`,
+		"security not an array":     `{"bearer":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for where, doc := range map[string]string{
+				"operation": `{"paths":{"/x":{"put":{"security":` + sec + `}}}}`,
+				"top-level": `{"security":` + sec + `,"paths":{"/x":{"put":{}}}}`,
+			} {
+				if _, err := bearerOnlySecurity(mustDoc(t, doc)); err == nil {
+					t.Errorf("%s: no error for %s", where, sec)
+				}
+			}
+		})
+	}
+}
+
+func TestPrepareSpec_RejectsMalformedSecurity(t *testing.T) {
+	_, _, err := prepareSpec([]byte(`{"paths":{"/x":{"get":{"security":[{"oauth2":"users:write"}]}}}}`))
+	if err == nil || !strings.Contains(err.Error(), "GET /x") {
+		t.Errorf("err = %v, want an error naming GET /x", err)
+	}
+}
+
+func TestRun_RejectsMalformedSecurity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "openapi-spec.json")
+	spec := []byte(`{"paths":{"/x":{"get":{"security":[{"oauth2":[123]}]}}}}`)
+	if err := os.WriteFile(path, spec, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"--prepare", "--spec", path}); err == nil {
+		t.Error("run --prepare accepted a malformed security requirement")
+	}
+	if out, _ := os.ReadFile(path); string(out) != string(spec) {
+		t.Errorf("spec rewritten: %s", out)
 	}
 }

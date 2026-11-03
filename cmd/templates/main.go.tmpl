@@ -17,6 +17,7 @@ import (
 
 	{{if .Security}}
 	"strings"
+	"sync"
 	"github.com/MicahParks/keyfunc/v2"
 	"github.com/golang-jwt/jwt/v5"
 	entitlements "github.com/kdex-tech/entitlements/go"
@@ -236,6 +237,11 @@ var operationRequirements = map[string][][]string{
 {{- end}}
 }
 
+// missingRequirementsLogged records each route authorize found absent from
+// operationRequirements, so that defect is logged once per route, not on every
+// request.
+var missingRequirementsLogged sync.Map
+
 type bindingContextKey struct{}
 
 // routeKeyContextKey carries the "METHOD /path" key of the operation a request
@@ -425,8 +431,19 @@ func (s *security) authorize(ctx context.Context, claims jwt.MapClaims) (context
 	}
 	binding, _ := ctx.Value(bindingContextKey{}).(entitlements.Binding)
 
+	alts, found := operationRequirements[route]
+	if !found {
+		// ogen called the security handler, so the operation declares
+		// security, yet the generator recorded no requirement for it: a
+		// generator or configuration defect, never the caller's. Every call is
+		// refused; say why once per route, outside debug.
+		if _, logged := missingRequirementsLogged.LoadOrStore(route, true); !logged {
+			log.Printf("security: no operationRequirements entry for %q; refusing every call to it", route)
+		}
+	}
+
 	ent := s.checker.ParseEntitlements(entitlements.Entitlements{"bearer": held})
-	for _, alt := range operationRequirements[route] {
+	for _, alt := range alts {
 		req := entitlements.Requirements{map[string][]string{"bearer": alt}}
 		// Bind each {placeholder} to the instance this request addresses before
 		// verifying: unbound, it is a literal only a held wildcard satisfies. An
@@ -446,7 +463,7 @@ func (s *security) authorize(ctx context.Context, claims jwt.MapClaims) (context
 	}
 
 	if s.debug {
-		fmt.Println("[DEBUG] entitlements", held, "satisfy none of", operationRequirements[route], "bound to", binding)
+		fmt.Println("[DEBUG] entitlements", held, "satisfy none of", alts, "bound to", binding)
 	}
 	return nil, false, nil
 }

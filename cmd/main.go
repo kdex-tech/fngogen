@@ -134,7 +134,10 @@ func run(args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
 
-	requirements := operationRequirements(spec)
+	requirements, err := operationRequirements(spec)
+	if err != nil {
+		return err
+	}
 
 	templateData := TemplateData{
 		APIImport:             *apiImportPtr,

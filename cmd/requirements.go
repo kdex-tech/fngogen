@@ -1,6 +1,9 @@
 package main
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // operationRequirements builds the per-operation authorization table the
 // generated server enforces. ogen merges same-scheme security alternatives
@@ -11,13 +14,18 @@ import "strings"
 // holds one []string per non-empty alternative (the union of that alternative's
 // scheme strings, via unionAlternative), in declaration order; satisfying any
 // one alternative admits the call. An operation inherits the top-level
-// security when it has no security key. An operation whose effective security
-// is [] or contains only {} alternatives has no entry, and {} alternatives are
-// dropped from an operation that also has non-empty ones. The result is the
-// same for a prepared and an unprepared spec.
-func operationRequirements(spec map[string]any) map[string][][]string {
+// security when it has no security key or a null one, as ogen does. An
+// operation whose effective security is [] or contains only {} alternatives
+// has no entry, and {} alternatives are dropped from an operation that also
+// has non-empty ones. The result is the same for a prepared and an unprepared
+// spec. A malformed security value is an error (see securityOf and
+// unionAlternative): generation fails rather than drop or weaken a requirement.
+func operationRequirements(spec map[string]any) (map[string][][]string, error) {
 	table := map[string][][]string{}
-	top, _ := spec["security"].([]any)
+	top, _, err := securityOf(spec, "top-level security")
+	if err != nil {
+		return nil, err
+	}
 	paths, _ := spec["paths"].(map[string]any)
 	for path, rawItem := range paths {
 		item, _ := rawItem.(map[string]any)
@@ -26,20 +34,29 @@ func operationRequirements(spec map[string]any) map[string][][]string {
 			if !ok {
 				continue
 			}
+			key := strings.ToUpper(method) + " " + path
 			sec := top
-			if own, ok := op["security"]; ok {
-				sec, _ = own.([]any)
+			own, present, err := securityOf(op, "security of "+key)
+			if err != nil {
+				return nil, err
+			}
+			if present {
+				sec = own
 			}
 			var alts [][]string
 			for _, a := range sec {
-				if alt, ok := a.(map[string]any); ok && len(alt) > 0 {
-					alts = append(alts, unionAlternative(alt))
+				if alt := a.(map[string]any); len(alt) > 0 {
+					union, err := unionAlternative(alt)
+					if err != nil {
+						return nil, fmt.Errorf("security of %s: %w", key, err)
+					}
+					alts = append(alts, union)
 				}
 			}
 			if len(alts) > 0 {
-				table[strings.ToUpper(method)+" "+path] = alts
+				table[key] = alts
 			}
 		}
 	}
-	return table
+	return table, nil
 }
