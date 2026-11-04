@@ -165,7 +165,7 @@ The function cannot mirror the gate's per-scheme buckets exactly (see the table 
   - Adding it could refuse existing gate-bypassing callers whose client holds no such grant, e.g. eum → blobsqlite with resource `/db/v1`.
   - Whether bypass paths should carry that check is a separate follow-up.
 - **The release stops at tagging fngogen and fnnodejsgen** (after the quad).
-  - Bumping nexus-manager's bundled default adaptor (`kdex-nexus-manager/config/faas/kdex-default-faas-adaptor-knative.yaml`, `fngogen:0.6.3`) is a separate step on the user's go.
+  - Bumping the default adaptor's generator is a separate step on the user's go. The adaptor clusters run is the kdex-knative-deployer chart's (`chart/templates/faas-adaptor.yaml`, then `fngogen:0.1.8`). nexus-manager's `config/faas` copy was never shipped and was removed (kdex-tech/nexus-manager#60). Done 2026-11-04 in knative-deployer v0.1.35.
   - Before that bump, check that no deployed spec declares a non-bearer scheme. The 2026-11-01 audit found none outside knowdb, which is service-backed.
 - **The contract update waits for kdex-crds#28.** `FUNCTION_CONTRACT.md` exists only on #28's unmerged branch, which belongs to another session. The required text goes onto #28 as a comment now, and into the file once #28 merges.
 - **fngogen lands on `main` independently of fngogen PR #17.** Whichever merges second rebases. The conflicts in `cmd/main.go` are mechanical.
