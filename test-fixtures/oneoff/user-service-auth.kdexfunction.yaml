@@ -1,0 +1,231 @@
+apiVersion: kdex.dev/v1alpha1
+kind: KDexFunction
+metadata:
+  name: user-service-auth
+  namespace: dev
+  labels:
+    kdex.dev/host: rsi-dev
+spec:
+  hostRef:
+    name: rsi-dev
+  serviceAccountName: user-service-sa
+  tolerations:
+    - key: cloud.google.com/gke-spot
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+    - key: component
+      operator: Equal
+      value: workload-amd64
+      effect: NoSchedule
+  nodeSelector:
+    kubernetes.io/arch: amd64
+    component: workload-amd64
+  origin:
+    source:
+      repository: https://gitlab.com/recoursellm-group/knowdrive-site
+      revision: main
+      path: functions/user-service-auth
+      regenerate: false
+      builder:
+        name: tiny
+        builderRef:
+          kind: ClusterBuilder
+          name: tiny-builder
+        languages:
+          - go
+          - rust
+        serviceAccountName: kdex-builder
+        resources:
+          requests:
+            memory: 2Gi
+          limits:
+            memory: 4Gi
+  api:
+    basePath: /v1/auth
+    paths:
+      /v1/auth/invite:
+        get:
+          operationId: previewInvite
+          summary: Return invite metadata (email, expiry) for a raw token
+          tags:
+            - public
+          security: []
+          parameters:
+            - in: query
+              name: token
+              required: true
+              schema:
+                type: string
+          responses:
+            "200":
+              description: Invite is valid; safe to display claim form
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    required:
+                      - email
+                      - expires_at
+                    properties:
+                      email:
+                        type: string
+                        format: email
+                      expires_at:
+                        type: string
+                        format: date-time
+            "404":
+              description: Token unknown, already claimed, expired, or revoked (single status code — anti-enumeration, no leakage between cases)
+      /v1/auth/claim-invite:
+        post:
+          operationId: claimInvite
+          summary: Consume an invite token and create the user account
+          tags:
+            - public
+          security: []
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema:
+                  type: object
+                  required:
+                    - token
+                    - password
+                  properties:
+                    token:
+                      type: string
+                      minLength: 1
+                    password:
+                      type: string
+                      minLength: 12
+                    given_name:
+                      type: string
+                    family_name:
+                      type: string
+                    preferred_language:
+                      type: string
+                    timezone:
+                      type: string
+          responses:
+            "201":
+              description: Account created; caller can now /-/login
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    required:
+                      - id
+                      - email
+                      - status
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                      email:
+                        type: string
+                        format: email
+                      status:
+                        type: string
+                        enum:
+                          - active
+            "400":
+              description: Validation failed (missing field, weak password, etc.)
+            "404":
+              description: Token unknown, expired, revoked, or already claimed
+            "409":
+              description: An account with this email already exists (rare race)
+      /v1/auth/forgot-password:
+        post:
+          operationId: forgotPassword
+          summary: Email a password-reset link (15-minute TTL) to the caller
+          tags:
+            - public
+          security: []
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema:
+                  type: object
+                  required:
+                    - email
+                  properties:
+                    email:
+                      type: string
+                      format: email
+          responses:
+            "202":
+              description: Reset link sent (or silently dropped if the email is not registered — anti-enumeration, no leakage between cases)
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    required:
+                      - status
+                    properties:
+                      status:
+                        type: string
+                        enum:
+                          - accepted
+      /v1/auth/reset-password:
+        post:
+          operationId: resetPassword
+          summary: Consume a password-reset token and set a new password
+          tags:
+            - public
+          security: []
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema:
+                  type: object
+                  required:
+                    - token
+                    - password
+                  properties:
+                    token:
+                      type: string
+                      minLength: 1
+                    password:
+                      type: string
+                      minLength: 12
+          responses:
+            "200":
+              description: Password updated; caller can now /-/login
+            "400":
+              description: Token invalid, expired, or already consumed
+  env:
+    - name: CLOUD_SQL_INSTANCE
+      value: augeinnovations:northamerica-northeast2:rsi-users-dev
+    - name: DB_USER
+      value: rsi-userservice-dev@augeinnovations.iam
+    - name: DB_NAME
+      value: users
+    - name: HOST_DOMAIN
+      value: dev.knowdrive.ai
+    - name: RESEND_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: knowdrive-resend-credentials
+          key: api_key
+    - name: RESEND_FROM_ADDRESS
+      valueFrom:
+        secretKeyRef:
+          name: knowdrive-resend-credentials
+          key: from_address
+    - name: HOST_INTERNAL_URL
+      value: http://rsi-dev.dev.svc.cluster.local:8090
+    - name: PLAN_VS_QUOTA_BYTES
+      value: "1073741824"
+    - name: VS_PROVISIONER_CLIENT_ID
+      valueFrom:
+        secretKeyRef:
+          name: vs-provisioner
+          key: client-id
+    - name: VS_PROVISIONER_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: vs-provisioner
+          key: client-secret
